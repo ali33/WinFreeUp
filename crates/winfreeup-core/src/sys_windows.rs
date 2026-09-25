@@ -4,6 +4,7 @@
 //! - đường dẫn hệ thống (Windows, System32, ổ hệ thống) lấy qua API chứ không qua `SystemRoot`/`windir`;
 //! - tiến trình con (PowerShell, DISM) chạy với môi trường dựng lại từ đầu, không mang biến của người dùng.
 use std::ffi::{c_void, OsStr, OsString};
+use std::marker::PhantomData;
 use std::io::{self, Read};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::AsRawHandle;
@@ -24,8 +25,8 @@ use windows_sys::Win32::Security::Authorization::{
     TRUSTEE_IS_SID, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::{
-    AdjustTokenPrivileges, CreateWellKnownSid, GetSecurityDescriptorControl, GetTokenInformation,
-    InitializeSecurityDescriptor, TokenUser, TOKEN_USER,
+    AdjustTokenPrivileges, CreateWellKnownSid, GetSecurityDescriptorControl, GetTokenInformation, ImpersonateSelf,
+    InitializeSecurityDescriptor, RevertToSelf, SecurityImpersonation, TokenUser, TOKEN_USER,
     LookupPrivilegeValueW, SetKernelObjectSecurity, SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
     SetSecurityDescriptorOwner, WinBuiltinAdministratorsSid, ACL, DACL_SECURITY_INFORMATION, LUID_AND_ATTRIBUTES,
     NO_INHERITANCE, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
@@ -34,7 +35,7 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, FileAttributeTagInfo, GetDiskFreeSpaceExW, GetFileInformationByHandle,
-    GetFileInformationByHandleEx, GetFinalPathNameByHandleW, BY_HANDLE_FILE_INFORMATION, FILE_ALL_ACCESS,
+    GetFileInformationByHandleEx, GetFinalPathNameByHandleW, GetLongPathNameW, BY_HANDLE_FILE_INFORMATION, FILE_ALL_ACCESS,
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
     FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL, VOLUME_NAME_DOS, WRITE_DAC, WRITE_OWNER,
@@ -52,7 +53,8 @@ use windows_sys::Win32::System::Registry::{
 };
 use windows_sys::Win32::System::SystemInformation::{GetSystemDirectoryW, GetSystemWindowsDirectoryW};
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, OpenProcessToken, OpenThread, ResumeThread, CREATE_SUSPENDED, THREAD_SUSPEND_RESUME,
+    GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThread, OpenThreadToken, ResumeThread, CREATE_SUSPENDED,
+    THREAD_SUSPEND_RESUME,
 };
 use windows_sys::Win32::UI::Shell::{
     SHEmptyRecycleBinW, SHQueryRecycleBinW, SHERB_NOCONFIRMATION, SHERB_NOPROGRESSUI, SHERB_NOSOUND, SHQUERYRBINFO,
@@ -81,8 +83,17 @@ const PRIVATE_DIR_SDDL: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
 /// Khóa HKLM chứa ProgramData và hồ sơ người dùng (chỉ Admin/SYSTEM ghi được).
 const PROFILE_LIST_KEY: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList";
 
-/// Một take_ownership tại một thời điểm (đặc quyền bật/tắt cho cả tiến trình).
+/// Một take_ownership tại một thời điểm. Đặc quyền đã theo luồng nên khóa không còn bắt buộc cho đúng đắn;
+/// giữ lại vì rẻ và để hai lần đổi chủ không đan xen trên cùng cây.
 static TAKE_OWNERSHIP_LOCK: Mutex<()> = Mutex::new(());
+/// Đặc quyền bật trong vùng găng của take_ownership (chỉ trên token luồng).
+const OWNERSHIP_PRIVILEGES: [(PCWSTR, &str); 3] = [
+    (SE_TAKE_OWNERSHIP_NAME, "SeTakeOwnershipPrivilege"),
+    (SE_RESTORE_NAME, "SeRestorePrivilege"),
+    (SE_BACKUP_NAME, "SeBackupPrivilege"),
+];
+/// Số lần thử tên mới cho ScratchDir trước khi bỏ cuộc.
+const SCRATCH_ATTEMPTS: u32 = 16;
 
 fn wide(s: &OsStr) -> Vec<u16> {
     s.encode_wide().chain(std::iter::once(0)).collect()
@@ -207,8 +218,10 @@ fn ps_modules_dir(system32: &Path) -> PathBuf {
 
 /// Môi trường tối thiểu cho tiến trình con, dựng hoàn toàn từ đường dẫn lấy qua API.
 /// Không mang TEMP/PSModulePath/PATH… của người dùng (DLL hijack qua %TEMP%, module giả qua PSModulePath).
-fn child_env(windir: &Path, system32: &Path) -> Vec<(&'static str, OsString)> {
-    let temp = windir.join("Temp").into_os_string();
+/// TEMP/TMP = `temp`: ScratchDir riêng của lần chạy (không phải C:\Windows\Temp dùng chung, nơi người dùng
+/// thường tạo được tệp).
+fn child_env(windir: &Path, system32: &Path, temp: &Path) -> Vec<(&'static str, OsString)> {
+    let temp = temp.as_os_str().to_os_string();
     let mut path = system32.as_os_str().to_os_string();
     for extra in [windir.to_path_buf(), system32.join("Wbem"), system32.join(r"WindowsPowerShell\v1.0")] {
         path.push(";");
@@ -238,8 +251,8 @@ fn child_env(windir: &Path, system32: &Path) -> Vec<(&'static str, OsString)> {
     env
 }
 
-fn child_env_from_api() -> Result<Vec<(&'static str, OsString)>> {
-    Ok(child_env(&windows_dir()?, &system_dir()?))
+fn child_env_from_api(temp: &Path) -> Result<Vec<(&'static str, OsString)>> {
+    Ok(child_env(&windows_dir()?, &system_dir()?, temp))
 }
 
 /// Đọc một thư mục hệ thống qua API kiểu `GetSystemDirectoryW` (không qua biến môi trường).
@@ -475,7 +488,7 @@ impl ErrorSummary {
 /// đường dẫn; thành phần giữa vẫn có thể đi qua junction — vì vậy mọi handle dùng để sửa ACL đều phải qua
 /// `open_checked` (kiểm trên chính handle). CreateFileW luôn xin kèm
 /// FILE_READ_ATTRIBUTES + SYNCHRONIZE: với mục mà DACL không cấp gì cho Administrators, hai quyền này chỉ có
-/// được nhờ SeBackupPrivilege (bật trong lúc take_ownership).
+/// được nhờ SeBackupPrivilege (bật trên token LUỒNG trong lúc take_ownership).
 fn open_for_security(path: &Path, access: u32) -> io::Result<OwnedHandle> {
     let w = wide(verbatim(path).as_os_str());
     // SAFETY: w kết thúc bằng NUL; security attributes và template được phép null.
@@ -532,6 +545,32 @@ fn final_path(h: &OwnedHandle) -> io::Result<Vec<u16>> {
         }
         buf.resize(n, 0);
     }
+}
+
+/// Như `final_path` nhưng cho tên dài của một đường dẫn (khử tên 8.3 kiểu `PROGRA~1`). `w` kết thúc NUL.
+fn long_path(w: &[u16]) -> io::Result<Vec<u16>> {
+    let mut buf = vec![0u16; 512];
+    loop {
+        // SAFETY: w kết thúc NUL; buf có đúng buf.len() phần tử khả ghi.
+        let n = unsafe { GetLongPathNameW(w.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
+        if n == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if n < buf.len() {
+            buf.truncate(n);
+            return Ok(buf);
+        }
+        buf.resize(n, 0);
+    }
+}
+
+/// `path` gọi đúng tên thật `real` (final path): không đi qua junction/symlink ở thư mục cha nào. So không
+/// phân biệt hoa thường; khác nhau thì khử tên 8.3 bằng GetLongPathNameW rồi so lại.
+fn names_real_path(path: &Path, real: &[u16]) -> bool {
+    let upper = |w: &[u16]| String::from_utf16_lossy(w).to_uppercase();
+    let real = upper(real);
+    let given = wide(verbatim(path).as_os_str());
+    upper(&given[..given.len() - 1]) == real || long_path(&given).is_ok_and(|l| upper(&l) == real)
 }
 
 /// `child` là chính `root` hoặc nằm bên dưới nó (so theo ranh giới `\`, để `C:\A` không khớp `C:\AB`).
@@ -635,8 +674,9 @@ fn trusted_owner(sid: &str) -> bool {
 }
 
 /// Duyệt cây từ `root`, cha trước con, gọi `visit(đường dẫn thật, gốc thật, lỗi)` cho từng mục đã qua
-/// `open_checked`. Reparse point và hard link bị bỏ qua (safety sẽ gỡ liên kết). Gốc là reparse point, hoặc
-/// (khi `require_trusted_owner`) gốc không do SYSTEM/TrustedInstaller/Administrators sở hữu ⇒ Err, không duyệt gì.
+/// `open_checked`. Reparse point và hard link bị bỏ qua (safety sẽ gỡ liên kết). Gốc là reparse point, gốc được
+/// gọi qua junction ở thư mục cha (đường dẫn thật khác đường dẫn truyền vào), hoặc (khi `require_trusted_owner`)
+/// gốc không do SYSTEM/TrustedInstaller/Administrators sở hữu ⇒ Err, không duyệt gì.
 fn walk_checked(
     root: &Path,
     require_trusted_owner: bool,
@@ -647,6 +687,13 @@ fn walk_checked(
     if attribute_tag(&root_h)? & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(io::Error::other("refusing: the root is a reparse point"));
     }
+    let root_real = final_path(&root_h)?;
+    if !names_real_path(root, &root_real) {
+        return Err(io::Error::other(format!(
+            "refusing: the root resolves to {} (a parent folder is a link)",
+            PathBuf::from(OsString::from_wide(&root_real)).display()
+        )));
+    }
     if require_trusted_owner {
         let owner = owner_sid_string(&root_h)?;
         if !trusted_owner(&owner) {
@@ -655,7 +702,6 @@ fn walk_checked(
             )));
         }
     }
-    let root_real = final_path(&root_h)?;
     drop(root_h);
     let mut stack = vec![PathBuf::from(OsString::from_wide(&root_real))];
     while let Some(p) = stack.pop() {
@@ -707,59 +753,76 @@ impl AdminsSid {
     }
 }
 
-/// Bật một đặc quyền cho token tiến trình; trả lại trạng thái cũ khi drop.
-struct PrivilegeGuard {
-    token: OwnedHandle,
-    previous: TOKEN_PRIVILEGES,
+/// Bật một đặc quyền trên `token`. AdjustTokenPrivileges trả TRUE cả khi token không có đặc quyền đó
+/// (vd tiến trình không phải Admin) — khi ấy mã lỗi cuối là ERROR_NOT_ALL_ASSIGNED.
+fn enable_privilege(token: &OwnedHandle, name: PCWSTR) -> io::Result<()> {
+    let mut luid = LUID::default();
+    // SAFETY: name là hằng chuỗi rộng kết thúc NUL của windows-sys; luid khả ghi.
+    check(unsafe { LookupPrivilegeValueW(std::ptr::null(), name, &mut luid) })?;
+    let wanted = TOKEN_PRIVILEGES {
+        PrivilegeCount: 1,
+        Privileges: [LUID_AND_ATTRIBUTES { Luid: luid, Attributes: SE_PRIVILEGE_ENABLED }],
+    };
+    // SAFETY: token mở với TOKEN_ADJUST_PRIVILEGES; không xin trạng thái cũ nên hai con trỏ ra được phép null.
+    check(unsafe { AdjustTokenPrivileges(token.0, 0, &wanted, 0, std::ptr::null_mut(), std::ptr::null_mut()) })?;
+    // SAFETY: chỉ đọc mã lỗi của luồng hiện tại.
+    let last = unsafe { GetLastError() };
+    if last == ERROR_NOT_ALL_ASSIGNED {
+        return Err(io::Error::from_raw_os_error(last as i32));
+    }
+    Ok(())
 }
 
-impl PrivilegeGuard {
-    fn enable(name: PCWSTR) -> io::Result<Self> {
+/// Đặc quyền bật trên token mạo danh của RIÊNG luồng hiện tại: `ImpersonateSelf` chép token tiến trình
+/// vào luồng này và đặc quyền chỉ bật trên bản chép. Luồng khác (vd handle DELETE của safety.rs mở bằng
+/// FILE_FLAG_BACKUP_SEMANTICS) vẫn dùng token tiến trình, nơi đặc quyền không hề đổi.
+/// Drop (kể cả khi unwind) gọi `RevertToSelf`, bản chép bị bỏ. `!Send`: Drop phải chạy trên đúng luồng
+/// đã mạo danh.
+struct ThreadPrivileges {
+    token: Option<OwnedHandle>,
+    _same_thread: PhantomData<*const ()>,
+}
+
+impl ThreadPrivileges {
+    /// Mạo danh rồi bật từng đặc quyền; đặc quyền nào không bật được thì ghi vào `notes` và chạy tiếp.
+    fn enable(privileges: &[(PCWSTR, &str)], notes: &mut Vec<String>) -> io::Result<Self> {
+        // SAFETY: không có tham số con trỏ; mạo danh chính token tiến trình trên luồng hiện tại.
+        check(unsafe { ImpersonateSelf(SecurityImpersonation) })?;
+        // Từ đây mọi đường thoát (kể cả `?`) đều qua Drop ⇒ RevertToSelf.
+        let mut this = Self { token: None, _same_thread: PhantomData };
         let mut raw: HANDLE = std::ptr::null_mut();
-        // SAFETY: GetCurrentProcess trả pseudo-handle luôn hợp lệ; raw là biến cục bộ khả ghi.
-        check(unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut raw) })?;
-        let token = OwnedHandle(raw);
-        let mut luid = LUID::default();
-        // SAFETY: name là hằng chuỗi rộng kết thúc NUL của windows-sys; luid khả ghi.
-        check(unsafe { LookupPrivilegeValueW(std::ptr::null(), name, &mut luid) })?;
-        let wanted = TOKEN_PRIVILEGES {
-            PrivilegeCount: 1,
-            Privileges: [LUID_AND_ATTRIBUTES { Luid: luid, Attributes: SE_PRIVILEGE_ENABLED }],
-        };
-        let mut previous = TOKEN_PRIVILEGES::default();
-        let mut len = 0u32;
-        // SAFETY: token mở với TOKEN_ADJUST_PRIVILEGES|TOKEN_QUERY; previous đủ chỗ cho một đặc quyền.
-        check(unsafe {
-            AdjustTokenPrivileges(
-                token.0,
-                0,
-                &wanted,
-                std::mem::size_of::<TOKEN_PRIVILEGES>() as u32,
-                &mut previous,
-                &mut len,
-            )
-        })?;
-        // AdjustTokenPrivileges trả TRUE cả khi token không có đặc quyền; phải xem mã lỗi cuối.
-        // SAFETY: chỉ đọc mã lỗi của luồng hiện tại.
-        let last = unsafe { GetLastError() };
-        if last == ERROR_NOT_ALL_ASSIGNED {
-            return Err(io::Error::from_raw_os_error(last as i32));
+        // SAFETY: pseudo-handle luồng luôn hợp lệ; raw là biến cục bộ; handle do OwnedHandle đóng.
+        // OpenAsSelf=TRUE: kiểm quyền mở token theo token tiến trình, không theo bản mạo danh.
+        check(unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, 1, &mut raw) })?;
+        let token = this.token.insert(OwnedHandle(raw));
+        for &(name, label) in privileges {
+            if let Err(e) = enable_privilege(token, name) {
+                notes.push(format!("{label} not enabled: {e}"));
+            }
         }
-        Ok(Self { token, previous })
+        Ok(this)
     }
 }
 
-impl Drop for PrivilegeGuard {
+impl Drop for ThreadPrivileges {
     fn drop(&mut self) {
-        // SAFETY: token còn mở (self sở hữu); previous do chính AdjustTokenPrivileges điền.
-        unsafe {
-            AdjustTokenPrivileges(self.token.0, 0, &self.previous, 0, std::ptr::null_mut(), std::ptr::null_mut())
-        };
+        self.token = None;
+        // SAFETY: luồng hiện tại đang mạo danh (enable đã thành công ImpersonateSelf) — `!Send` bảo đảm
+        // đây đúng là luồng đó.
+        if unsafe { RevertToSelf() } == 0 {
+            // Không thể để luồng chạy tiếp với token đang bật SeBackup/SeRestore/SeTakeOwnership.
+            std::process::abort();
+        }
     }
 }
 
-fn enable_privilege(name: PCWSTR, label: &str, notes: &mut Vec<String>) -> Option<PrivilegeGuard> {
-    PrivilegeGuard::enable(name).map_err(|e| notes.push(format!("{label} not enabled: {e}"))).ok()
+/// Vùng găng của take_ownership: giữ TAKE_OWNERSHIP_LOCK, bật đặc quyền trên token luồng, chạy `f` trên
+/// CHÍNH luồng gọi (mọi CreateFile/SetKernelObjectSecurity cần đặc quyền phải nằm trong `f`, không sinh
+/// luồng con), rồi RevertToSelf và nhả khóa — theo thứ tự đó, kể cả khi `f` panic.
+fn with_ownership_privileges<R>(notes: &mut Vec<String>, f: impl FnOnce() -> R) -> io::Result<R> {
+    let _serial = TAKE_OWNERSHIP_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _privileges = ThreadPrivileges::enable(&OWNERSHIP_PRIVILEGES, notes)?;
+    Ok(f())
 }
 
 /// Descriptor tuyệt đối rỗng trên stack; SetKernelObjectSecurity ghi thẳng, KHÔNG lan quyền xuống con
@@ -935,6 +998,15 @@ struct ScratchDir(PathBuf);
 
 impl ScratchDir {
     fn create(parent: &Path) -> io::Result<Self> {
+        Self::create_named(|attempt| {
+            let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+            parent.join(format!("WinFreeUp-{}-{nanos}-{attempt}", std::process::id()))
+        })
+    }
+
+    /// Thử lần lượt các tên do `name(lần thử)` sinh ra; tên đã có (thư mục, junction, tệp) ⇒ sang tên kế,
+    /// hết SCRATCH_ATTEMPTS lần ⇒ Err.
+    fn create_named(mut name: impl FnMut(u32) -> PathBuf) -> io::Result<Self> {
         let sddl = wide(OsStr::new(PRIVATE_DIR_SDDL));
         let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
         // SAFETY: sddl kết thúc NUL; sd do LocalMem giải phóng; con trỏ kích thước được phép null.
@@ -952,9 +1024,8 @@ impl ScratchDir {
             lpSecurityDescriptor: sd,
             bInheritHandle: 0,
         };
-        for attempt in 0..16u32 {
-            let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-            let dir = parent.join(format!("WinFreeUp-{}-{nanos}-{attempt}", std::process::id()));
+        for attempt in 0..SCRATCH_ATTEMPTS {
+            let dir = name(attempt);
             let w = wide(verbatim(&dir).as_os_str());
             // SAFETY: w kết thúc NUL; sa trỏ tới descriptor còn sống tới hết hàm.
             if unsafe { CreateDirectoryW(w.as_ptr(), &sa) } != 0 {
@@ -1006,8 +1077,15 @@ pub struct RealSystem {
 
 impl RealSystem {
     fn powershell(&self, script: &str) -> Result<String> {
+        let scratch = ScratchDir::create(&windows_dir()?.join("Temp"))
+            .map_err(|e| CoreError::System(format!("PowerShell scratch directory: {e}")))?;
+        self.powershell_in(script, &scratch)
+    }
+
+    /// PowerShell với TEMP/TMP = `scratch` (thư mục riêng, xóa khi `scratch` drop sau lời gọi).
+    fn powershell_in(&self, script: &str, scratch: &ScratchDir) -> Result<String> {
         let exe = self.system32.join(r"WindowsPowerShell\v1.0\powershell.exe");
-        let env = child_env_from_api()?;
+        let env = child_env_from_api(&scratch.0)?;
         let script = ps_script(script, &system_dir()?);
         let args: Vec<&OsStr> = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &script]
             .into_iter()
@@ -1055,9 +1133,9 @@ impl SystemOps for RealSystem {
     fn run_dism(&self, args: &[&str], cancel: &CancelToken, on_line: &mut dyn FnMut(&str)) -> Result<()> {
         refuse_resetbase(args)?;
         let exe = self.system32.join("Dism.exe");
-        let env = child_env_from_api()?;
         let scratch = ScratchDir::create(&windows_dir()?.join("Temp"))
             .map_err(|e| CoreError::System(format!("DISM scratch directory: {e}")))?;
+        let env = child_env_from_api(&scratch.0)?;
         let mut cmd = Command::new(&exe);
         cmd.args(dism_args(args, &scratch.0))
             .env_clear()
@@ -1157,22 +1235,14 @@ impl SystemOps for RealSystem {
     /// Mỗi mục được kiểm trên chính handle sẽ sửa (không liên kết, không hard link, đường dẫn thật trong gốc).
     /// Làm đủ cả hai bước cho mọi mục; lỗi gộp lại sau khi chạy hết.
     fn take_ownership(&self, path: &Path) -> Result<()> {
-        // Đặc quyền bật cho cả tiến trình: hai lời gọi chồng nhau thì lời xong trước sẽ tắt đặc quyền
-        // của lời kia giữa chừng. Khóa suốt từ lúc bật tới lúc trả đặc quyền.
-        let _serial = TAKE_OWNERSHIP_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let what = format!("take_ownership {}", path.display());
         let admins = AdminsSid::new().map_err(|e| CoreError::System(format!("{what}: Administrators SID: {e}")))?;
         let mut notes = Vec::new();
-        let take = enable_privilege(SE_TAKE_OWNERSHIP_NAME, "SeTakeOwnershipPrivilege", &mut notes);
-        let restore = enable_privilege(SE_RESTORE_NAME, "SeRestorePrivilege", &mut notes);
-        let backup = enable_privilege(SE_BACKUP_NAME, "SeBackupPrivilege", &mut notes);
         let mut errors = ErrorSummary::default();
-        let walked = walk_checked(path, true, &mut errors, &mut |p, root, errors| {
-            own_and_grant_item(p, root, &admins, errors)
-        });
-        drop(backup);
-        drop(restore);
-        drop(take);
+        let walked = with_ownership_privileges(&mut notes, || {
+            walk_checked(path, true, &mut errors, &mut |p, root, errors| own_and_grant_item(p, root, &admins, errors))
+        })
+        .map_err(|e| CoreError::System(format!("{what}: thread impersonation: {e}")))?;
         walked.map_err(|e| CoreError::System(format!("{what}: {e}")))?;
         errors.into_result(&what, (!notes.is_empty()).then(|| notes.join("; ")))
     }
@@ -1203,7 +1273,9 @@ mod tests {
     use windows_sys::Win32::Security::Authorization::{
         ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW, SetNamedSecurityInfoW,
     };
-    use windows_sys::Win32::Security::GetSecurityDescriptorDacl;
+    use windows_sys::Win32::Foundation::ERROR_NO_TOKEN;
+    use windows_sys::Win32::Security::{GetSecurityDescriptorDacl, TokenPrivileges};
+    use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
 
     #[test]
     fn split_lines_handles_carriage_returns_and_partial_chunks() {
@@ -1263,7 +1335,7 @@ mod tests {
             }
             assert!(system32.starts_with(&windir), "{}", system32.display());
             assert!(system32.join("Dism.exe").is_file());
-            let child = child_env(&windir, &system32);
+            let child = child_env(&windir, &system32, &windir.join(r"Temp\WinFreeUp-x"));
             assert!(child.iter().all(|(_, v)| !Path::new(v).starts_with(&fake)));
             return;
         }
@@ -1289,13 +1361,14 @@ mod tests {
 
     #[test]
     fn child_processes_get_a_minimal_environment_built_from_system_paths() {
-        let env = child_env(Path::new(r"C:\Windows"), Path::new(r"C:\Windows\System32"));
+        let scratch = r"C:\Windows\Temp\WinFreeUp-1-2-0";
+        let env = child_env(Path::new(r"C:\Windows"), Path::new(r"C:\Windows\System32"), Path::new(scratch));
         let get = |k: &str| env.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string_lossy().into_owned());
         assert_eq!(get("SystemRoot").as_deref(), Some(r"C:\Windows"));
         assert_eq!(get("windir").as_deref(), Some(r"C:\Windows"));
         assert_eq!(get("SystemDrive").as_deref(), Some("C:"));
-        assert_eq!(get("TEMP").as_deref(), Some(r"C:\Windows\Temp"));
-        assert_eq!(get("TMP").as_deref(), Some(r"C:\Windows\Temp"));
+        assert_eq!(get("TEMP").as_deref(), Some(scratch));
+        assert_eq!(get("TMP").as_deref(), Some(scratch));
         assert_eq!(get("ComSpec").as_deref(), Some(r"C:\Windows\System32\cmd.exe"));
         assert_eq!(get("PSModulePath").as_deref(), Some(r"C:\Windows\System32\WindowsPowerShell\v1.0\Modules"));
         let path = get("PATH").unwrap();
@@ -1306,17 +1379,37 @@ mod tests {
         }
     }
 
-    /// Chạy PowerShell thật với môi trường tối thiểu, chỉ đọc (không đổi gì trên máy).
+    /// TEMP/TMP của tiến trình con lấy từ ScratchDir truyền vào, không từ C:\Windows\Temp hay môi trường.
+    #[test]
+    fn child_env_from_api_uses_the_given_scratch_dir_as_temp() {
+        let scratch = Path::new(r"C:\Windows\Temp\WinFreeUp-9-9-0");
+        let env = child_env_from_api(scratch).unwrap();
+        let get = |k: &str| env.iter().find(|(n, _)| *n == k).map(|(_, v)| PathBuf::from(v));
+        assert_eq!(get("TEMP").as_deref(), Some(scratch));
+        assert_eq!(get("TMP").as_deref(), Some(scratch));
+        assert_eq!(get("SystemRoot"), Some(windows_dir().unwrap()));
+    }
+
+    /// Chạy PowerShell thật với môi trường tối thiểu, chỉ đọc (không đổi gì trên máy). ScratchDir nằm trong
+    /// thư mục tạm của test (không phải C:\Windows\Temp) để dọn được cả khi không nâng quyền.
     #[test]
     fn powershell_runs_with_the_minimal_environment() {
         let system32 = system_dir().unwrap();
-        let windir = windows_dir().unwrap();
         let sys = RealSystem { system32: system32.clone() };
+        let parent = tempfile::tempdir().unwrap();
+        let scratch = ScratchDir::create(parent.path()).unwrap();
         let out = sys
-            .powershell("$env:TEMP + '|' + $env:PSModulePath + '|' + (Get-Service -Name 'wuauserv').Name")
+            .powershell_in(
+                "$env:TEMP + '|' + $env:TMP + '|' + $env:PSModulePath + '|' + (Get-Service -Name 'wuauserv').Name",
+                &scratch,
+            )
             .unwrap();
-        let expected = format!("{}|{}|wuauserv", windir.join("Temp").display(), ps_modules_dir(&system32).display());
+        let expected = format!("{0}|{0}|{1}|wuauserv", scratch.0.display(), ps_modules_dir(&system32).display());
         assert!(out.eq_ignore_ascii_case(&expected), "{out}");
+        unlock_for_test(&scratch.0);
+        let path = scratch.0.clone();
+        drop(scratch);
+        assert!(!path.exists());
     }
 
     #[test]
@@ -1422,6 +1515,53 @@ mod tests {
         let path = a.0.clone();
         drop(a);
         assert!(!path.exists());
+    }
+
+    /// Tên dự kiến đã có sẵn (thư mục, junction, tệp) ⇒ sang tên kế, không bao giờ dùng lại mục có sẵn.
+    #[test]
+    fn scratch_dir_skips_names_that_already_exist() {
+        let parent = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let name = |i: u32| parent.path().join(format!("s{i}"));
+        std::fs::create_dir(name(0)).unwrap();
+        std::fs::write(name(0).join("keep.txt"), b"k").unwrap();
+        junction::create(target.path(), name(1)).unwrap();
+        std::fs::write(name(2), b"f").unwrap();
+        let before = [sddl(&name(0)), sddl(target.path())];
+        let mut tried = Vec::new();
+        let dir = ScratchDir::create_named(|i| {
+            tried.push(i);
+            name(i)
+        })
+        .unwrap();
+        assert_eq!(tried, vec![0, 1, 2, 3]);
+        assert_eq!(dir.0, name(3));
+        assert!(dir.0.is_dir());
+        assert_eq!([sddl(&name(0)), sddl(target.path())], before);
+        assert_eq!(std::fs::read(name(0).join("keep.txt")).unwrap(), b"k");
+        assert!(std::fs::read_dir(target.path()).unwrap().next().is_none());
+        assert_eq!(std::fs::read(name(2)).unwrap(), b"f");
+        unlock_for_test(&dir.0);
+        drop(dir);
+        assert!(!name(3).exists());
+    }
+
+    #[test]
+    fn scratch_dir_gives_up_after_sixteen_taken_names() {
+        let parent = tempfile::tempdir().unwrap();
+        let taken = parent.path().join("taken");
+        std::fs::create_dir(&taken).unwrap();
+        let mut calls = 0;
+        let err = ScratchDir::create_named(|_| {
+            calls += 1;
+            taken.clone()
+        })
+        .map(|d| d.0.clone())
+        .unwrap_err();
+        assert_eq!(calls, SCRATCH_ATTEMPTS);
+        assert_eq!(calls, 16);
+        assert!(err.to_string().contains("unique scratch directory"), "{err}");
+        assert!(std::fs::read_dir(&taken).unwrap().next().is_none());
     }
 
     /// Chủ sở hữu luôn có WRITE_DAC ngầm định: thay DACL bằng Everyone Full Control để dọn được.
@@ -1683,5 +1823,204 @@ mod tests {
             [outside.path().to_path_buf(), outside.path().join("secret.txt"), outside.path().join("linked.txt")]
                 .map(|p| sddl(&p));
         assert_eq!(after_outside, before_outside);
+    }
+
+    /// base/{real/sub/f.txt, j -> real}: gọi `base\j\sub` là đi qua junction ở thư mục cha.
+    #[test]
+    fn walk_refuses_a_root_reached_through_a_junction_in_a_parent() {
+        let base = tempfile::tempdir().unwrap();
+        let sub = base.path().join(r"real\sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("f.txt"), b"x").unwrap();
+        junction::create(base.path().join("real"), base.path().join("j")).unwrap();
+        let via = base.path().join(r"j\sub");
+        let before = (sddl(&sub), sddl(&sub.join("f.txt")));
+
+        let mut seen = Vec::new();
+        let mut errors = ErrorSummary::default();
+        let err = walk_checked(&via, false, &mut errors, &mut |p, _, _| seen.push(p.to_path_buf())).unwrap_err();
+        assert!(err.to_string().contains("a parent folder is a link"), "{err}");
+        assert!(seen.is_empty() && errors.count == 0);
+
+        let sys = RealSystem { system32: PathBuf::from(r"C:\nonexistent") };
+        let err = sys.take_ownership(&via).unwrap_err().to_string();
+        assert!(err.contains("a parent folder is a link"), "{err}");
+        assert_eq!((sddl(&sub), sddl(&sub.join("f.txt"))), before);
+
+        // Cùng thư mục, gọi đúng tên (kể cả khác hoa thường) thì được duyệt.
+        let upper = PathBuf::from(sub.to_string_lossy().to_uppercase());
+        for p in [sub.clone(), upper] {
+            let mut n = 0;
+            walk_checked(&p, false, &mut ErrorSummary::default(), &mut |_, _, _| n += 1).unwrap();
+            assert_eq!(n, 2, "{}", p.display());
+        }
+    }
+
+    /// Tên 8.3 của gốc (nếu ổ có sinh tên ngắn) được khử bằng GetLongPathNameW, không bị coi là junction.
+    #[test]
+    fn walk_accepts_a_root_given_by_its_short_name() {
+        let base = tempfile::tempdir().unwrap();
+        let long = base.path().join("thu muc ten rat dai de co ten ngan");
+        std::fs::create_dir(&long).unwrap();
+        let w = wide(long.as_os_str());
+        let mut buf = vec![0u16; 1024];
+        // SAFETY: w kết thúc NUL; buf có đúng buf.len() phần tử khả ghi.
+        let n = unsafe { GetShortPathNameW(w.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
+        assert!(n > 0 && n < buf.len(), "{}", io::Error::last_os_error());
+        let short = PathBuf::from(OsString::from_wide(&buf[..n]));
+        let mut n = 0;
+        walk_checked(&short, false, &mut ErrorSummary::default(), &mut |_, _, _| n += 1).unwrap();
+        assert_eq!(n, 1, "{}", short.display());
+    }
+
+    fn ownership_luids() -> [LUID; 3] {
+        OWNERSHIP_PRIVILEGES.map(|(name, _)| {
+            let mut luid = LUID::default();
+            // SAFETY: name là hằng chuỗi rộng kết thúc NUL; luid khả ghi.
+            check(unsafe { LookupPrivilegeValueW(std::ptr::null(), name, &mut luid) }).unwrap();
+            luid
+        })
+    }
+
+    /// Trạng thái ba đặc quyền đổi chủ trong `token`: None = token không có, Some(bật hay không).
+    fn privilege_states(token: &OwnedHandle) -> [Option<bool>; 3] {
+        let mut buf = vec![0u64; 64];
+        loop {
+            let mut needed = 0u32;
+            // SAFETY: buf khả ghi đúng số byte truyền vào; needed là biến cục bộ.
+            let ok = unsafe {
+                GetTokenInformation(token.0, TokenPrivileges, buf.as_mut_ptr().cast(), (buf.len() * 8) as u32, &mut needed)
+            };
+            if ok != 0 {
+                break;
+            }
+            let e = io::Error::last_os_error();
+            assert_eq!(e.raw_os_error(), Some(ERROR_INSUFFICIENT_BUFFER as i32), "{e}");
+            buf.resize((needed as usize).div_ceil(8), 0);
+        }
+        let tp = buf.as_ptr() as *const TOKEN_PRIVILEGES;
+        // SAFETY: GetTokenInformation vừa ghi một TOKEN_PRIVILEGES hợp lệ ở đầu buf; mảng Privileges có đúng
+        // PrivilegeCount phần tử, nằm trong buf.
+        let all = unsafe {
+            let first = std::ptr::addr_of!((*tp).Privileges).cast::<LUID_AND_ATTRIBUTES>();
+            std::slice::from_raw_parts(first, (*tp).PrivilegeCount as usize)
+        };
+        ownership_luids().map(|luid| {
+            all.iter()
+                .find(|p| p.Luid.LowPart == luid.LowPart && p.Luid.HighPart == luid.HighPart)
+                .map(|p| p.Attributes & SE_PRIVILEGE_ENABLED != 0)
+        })
+    }
+
+    fn process_privilege_states() -> [Option<bool>; 3] {
+        let mut raw: HANDLE = std::ptr::null_mut();
+        // SAFETY: pseudo-handle tiến trình luôn hợp lệ; raw cục bộ; handle do OwnedHandle đóng.
+        check(unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw) }).unwrap();
+        privilege_states(&OwnedHandle(raw))
+    }
+
+    /// Token mạo danh của luồng hiện tại, hoặc mã lỗi (ERROR_NO_TOKEN = luồng không mạo danh).
+    fn thread_token() -> std::result::Result<OwnedHandle, u32> {
+        let mut raw: HANDLE = std::ptr::null_mut();
+        // SAFETY: pseudo-handle luồng luôn hợp lệ; raw cục bộ; handle do OwnedHandle đóng.
+        if unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut raw) } != 0 {
+            Ok(OwnedHandle(raw))
+        } else {
+            // SAFETY: chỉ đọc mã lỗi của luồng hiện tại.
+            Err(unsafe { GetLastError() })
+        }
+    }
+
+    /// Mỗi đặc quyền: hoặc bật trên token luồng, hoặc có ghi chú nói rõ vì sao không (không Admin ⇒
+    /// ERROR_NOT_ALL_ASSIGNED) — không bao giờ lặng im.
+    fn assert_enabled_or_noted(states: [Option<bool>; 3], notes: &[String]) {
+        for (i, (_, label)) in OWNERSHIP_PRIVILEGES.iter().enumerate() {
+            let noted = notes.iter().any(|n| n.starts_with(label));
+            assert!(states[i] == Some(true) || noted, "{label}: {states:?} {notes:?}");
+        }
+    }
+
+    /// (a) Hai lời gọi không bao giờ chồng nhau: đếm số vùng găng đang chạy cùng lúc, tối đa phải là 1.
+    #[test]
+    fn ownership_critical_sections_never_overlap() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let done = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    for _ in 0..5 {
+                        let mut notes = Vec::new();
+                        with_ownership_privileges(&mut notes, || {
+                            let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak.fetch_max(now, Ordering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(5));
+                            active.fetch_sub(1, Ordering::SeqCst);
+                            done.fetch_add(1, Ordering::SeqCst);
+                        })
+                        .unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(done.load(Ordering::SeqCst), 20);
+        assert_eq!(peak.load(Ordering::SeqCst), 1);
+    }
+
+    /// (b) Sau take_ownership (Ok hay Err) và sau panic trong vùng găng: token tiến trình y như trước, luồng
+    /// đã RevertToSelf.
+    #[test]
+    fn ownership_privileges_never_outlive_the_call() {
+        let before = process_privilege_states();
+        assert_eq!(thread_token().err(), Some(ERROR_NO_TOKEN));
+        let sys = RealSystem { system32: PathBuf::from(r"C:\nonexistent") };
+        let tree = tempfile::tempdir().unwrap();
+        std::fs::write(tree.path().join("f.txt"), b"x").unwrap();
+        // Không nâng quyền: Err (thư mục tạm do người dùng sở hữu); nâng quyền: Ok. Cả hai đều phải sạch.
+        let _ = sys.take_ownership(tree.path());
+        assert_eq!(process_privilege_states(), before);
+        assert_eq!(thread_token().err(), Some(ERROR_NO_TOKEN));
+        assert!(sys.take_ownership(&tree.path().join("khong-co")).is_err());
+        assert_eq!(process_privilege_states(), before);
+        assert_eq!(thread_token().err(), Some(ERROR_NO_TOKEN));
+
+        let mut notes = Vec::new();
+        let mut inside = None;
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_ownership_privileges(&mut notes, || {
+                inside = Some(privilege_states(&thread_token().expect("impersonating inside")));
+                panic!("panic in the critical section");
+            })
+        }));
+        assert!(panicked.is_err());
+        assert_enabled_or_noted(inside.unwrap(), &notes);
+        assert_eq!(process_privilege_states(), before);
+        assert_eq!(thread_token().err(), Some(ERROR_NO_TOKEN));
+        for (i, state) in process_privilege_states().iter().enumerate() {
+            assert!(*state != Some(true) || before[i] == Some(true), "{}", OWNERSHIP_PRIVILEGES[i].1);
+        }
+    }
+
+    /// (c) Trong lúc vùng găng đang chạy, luồng khác thấy token tiến trình không đổi và không mạo danh gì.
+    #[test]
+    fn ownership_privileges_are_enabled_on_the_calling_thread_only() {
+        let before = process_privilege_states();
+        let mut notes = Vec::new();
+        let (mine, other) = with_ownership_privileges(&mut notes, || {
+            let mine = privilege_states(&thread_token().expect("impersonating inside"));
+            let other = std::thread::spawn(|| (process_privilege_states(), thread_token().err())).join().unwrap();
+            (mine, other)
+        })
+        .unwrap();
+        assert_enabled_or_noted(mine, &notes);
+        assert_eq!(other, (before, Some(ERROR_NO_TOKEN)));
+        for i in 0..3 {
+            if mine[i] == Some(true) && before[i] != Some(true) {
+                // Chứng minh trực tiếp: cùng thời điểm, bật trên luồng này nhưng không bật trên token tiến trình.
+                assert_ne!(other.0[i], Some(true));
+            }
+        }
+        assert_eq!(process_privilege_states(), before);
     }
 }
