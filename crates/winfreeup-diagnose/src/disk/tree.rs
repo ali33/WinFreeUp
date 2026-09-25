@@ -52,6 +52,9 @@ impl TreeBuilder {
     /// Thêm một nút; `bytes`, `modified` là của riêng nút (file) — thư mục truyền 0.
     /// Nút mang `FLAG_LINK` (junction, tên thứ hai của hard link) không được đếm là file.
     pub fn add(&mut self, parent: NodeId, name: &str, flags: u16, bytes: u64, modified: u32) -> NodeId {
+        // NO_PARENT (u32::MAX) là giá trị canh, nên id hợp lệ phải nhỏ hơn nó.
+        debug_assert!(self.nodes.len() < NO_PARENT as usize, "quá nhiều nút cho NodeId u32");
+        debug_assert!(self.names.len() <= u32::MAX as usize, "bảng tên vượt u32");
         let id = self.nodes.len() as NodeId;
         let name = truncate_name(name);
         let name_off = self.names.len() as u32;
@@ -83,6 +86,7 @@ impl TreeBuilder {
     pub fn finish(self, root: NodeId) -> DiskTree {
         let TreeBuilder { mut nodes, names } = self;
         let n = nodes.len();
+        debug_assert!(n < NO_PARENT as usize, "quá nhiều nút cho NodeId u32");
         // CSR: đếm con của từng nút.
         let mut start = vec![0u32; n + 1];
         for (i, node) in nodes.iter().enumerate() {
@@ -229,29 +233,39 @@ impl DiskTree {
         }
     }
 
+    /// `id` phải hợp lệ (`< len()`), nếu không sẽ panic.
     pub fn name(&self, id: NodeId) -> &str {
         name_of(&self.names, &self.nodes[id as usize])
     }
 
+    /// `id` phải hợp lệ (`< len()`), nếu không sẽ panic.
     pub fn bytes(&self, id: NodeId) -> u64 {
         self.nodes[id as usize].bytes
     }
 
+    /// `id` phải hợp lệ (`< len()`), nếu không sẽ panic.
     pub fn files(&self, id: NodeId) -> u64 {
         u64::from(self.nodes[id as usize].files)
     }
 
+    /// `id` phải hợp lệ (`< len()`), nếu không sẽ panic.
     pub fn is_dir(&self, id: NodeId) -> bool {
         self.nodes[id as usize].flags & FLAG_DIR != 0
     }
 
+    /// `id` phải hợp lệ (`< len()`), nếu không sẽ panic.
     pub fn parent_of(&self, id: NodeId) -> Option<NodeId> {
         let p = self.nodes[id as usize].parent;
         (id != self.root && p != NO_PARENT).then_some(p)
     }
 
     /// Đường dẫn đầy đủ: tên gốc (vd `C:\`) nối các tên con bằng `\`.
+    /// Nút không còn trong cây (`contains` = false: đã xóa, mồ côi, nằm trong vòng) ⇒ chuỗi rỗng,
+    /// không bao giờ trả một đường giả.
     pub fn path(&self, id: NodeId) -> String {
+        if !self.contains(id) {
+            return String::new();
+        }
         let mut parts = Vec::new();
         let mut cur = id;
         while cur != NO_PARENT && cur != self.root {
@@ -273,6 +287,7 @@ impl DiskTree {
         self.child_list[a..b].iter().copied().filter(|&c| self.nodes[c as usize].flags & FLAG_DELETED == 0)
     }
 
+    /// `id` phải hợp lệ (`< len()`), nếu không sẽ panic. Nút không còn trong cây có `path` rỗng.
     pub fn view(&self, id: NodeId) -> NodeView {
         let n = &self.nodes[id as usize];
         NodeView {
@@ -309,6 +324,8 @@ impl DiskTree {
     }
 
     /// Sau khi xóa vào Thùng rác: đánh dấu nút đã xóa và trừ byte/số file khỏi mọi tổ tiên (không quét lại).
+    /// `modified` của tổ tiên KHÔNG được tính lại (giữ ngày sửa lớn nhất lúc quét).
+    /// Cần đường dẫn của nút thì lấy `path` TRƯỚC khi gọi — sau đó `path` trả chuỗi rỗng.
     pub fn remove(&mut self, id: NodeId) -> Option<Removed> {
         if !self.contains(id) || id == self.root {
             return None;
@@ -402,6 +419,7 @@ mod tests {
         assert_eq!(t.bytes(root), 105);
         assert_eq!(t.files(root), 2);
         assert!(!t.contains(a));
+        assert_eq!(t.path(a), "");
         assert_eq!(t.children(big, MAX_CHILDREN).unwrap().items.len(), 1);
         assert_eq!(t.remove(a), None, "xóa lần hai không trừ thêm");
         assert_eq!(t.remove(root), None, "không xóa gốc");
@@ -487,7 +505,7 @@ mod tests {
             assert!(!t.contains(id));
             assert!(t.children(id, MAX_CHILDREN).is_none());
             assert_eq!(t.parent_of(id), None);
-            assert_eq!(t.path(id), format!("F:\\{}", t.name(id)));
+            assert_eq!(t.path(id), "", "không trả đường giả cho nút ngoài cây");
         }
         assert_eq!(t.remove(q), None);
     }
