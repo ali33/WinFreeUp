@@ -1,4 +1,5 @@
-//! Ảnh chụp giá trị cũ để hoàn tác (spec mục 3.3): `%LOCALAPPDATA%\WinFreeUp\tweaks-undo.json`.
+//! Ảnh chụp giá trị cũ để hoàn tác (spec mục 3.3), file `tweaks-undo.json`.
+//! Đường dẫn do bên gọi truyền (Task 12: `secure_data_dir()?.join(FILE_NAME)`).
 //! Chỉ ghi lần đầu; ghi file tạm rồi đổi tên; file hỏng ⇒ đổi thành `.bak`, không xoá.
 //! Không đọc được / không cất được file hỏng / gặp reparse point ⇒ kho chỉ-đọc: `save()` trả lỗi,
 //! không bao giờ ghi đè file đang có.
@@ -45,11 +46,6 @@ pub struct UndoStore {
     file: UndoFile,
     /// `Some(lý do)` ⇒ không được ghi: `save()` trả `Err`, file trên đĩa giữ nguyên.
     readonly: Option<String>,
-}
-
-/// `%LOCALAPPDATA%\WinFreeUp\tweaks-undo.json`.
-pub fn default_path(local_appdata: &Path) -> PathBuf {
-    local_appdata.join("WinFreeUp").join(FILE_NAME)
 }
 
 /// Tên `.bak` chưa dùng: `x.json.bak`, rồi `x.json.bak1` … `x.json.bak99`; hết ⇒ `None`.
@@ -231,7 +227,7 @@ mod tests {
     #[test]
     fn snapshot_is_written_only_the_first_time_and_survives_reload() {
         let d = tempfile::tempdir().unwrap();
-        let p = default_path(d.path());
+        let p = d.path().join("WinFreeUp").join(FILE_NAME);
         let (mut s, _) = UndoStore::load(&p);
         assert!(s.record_if_absent("ads_id", 0, snap(1)));
         assert!(!s.record_if_absent("ads_id", 0, snap(0)), "áp dụng lại không đè ảnh chụp gốc");
