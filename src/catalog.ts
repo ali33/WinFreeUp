@@ -23,11 +23,19 @@ export function groupDesc(id: string): string {
   return t(`group.${id}.desc`);
 }
 
-/** Dịch mã thông báo của lõi (vd "browser_running:chrome"). Mã lạ giữ nguyên để vẫn thấy được. */
+/**
+ * Dịch mã thông báo của lõi (vd "browser_running:chrome", "root_rejected:C:\Users\a\AppData").
+ * Không dùng `split(':')` để tách phần sau tiền tố — đường dẫn Windows có `C:` nên sẽ bị cắt sai
+ * chỗ; dùng `slice` theo độ dài tiền tố để giữ nguyên cả đường dẫn. Mã lạ giữ nguyên để vẫn thấy được.
+ */
 export function noticeText(code: string): string {
-  const [kind, arg] = code.split(':');
-  if (kind === 'browser_running' && arg) {
-    return t('notice.browserRunning', { name: t(`browser.${arg}`) });
+  if (code.startsWith('browser_running:')) {
+    const arg = code.slice('browser_running:'.length);
+    if (arg) return t('notice.browserRunning', { name: t(`browser.${arg}`) });
+  } else if (code.startsWith('root_rejected:')) {
+    return t('notice.rootRejected', { path: code.slice('root_rejected:'.length) });
+  } else if (code.startsWith('root_unreadable:')) {
+    return t('notice.rootUnreadable', { path: code.slice('root_unreadable:'.length) });
   }
   return code;
 }
