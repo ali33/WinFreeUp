@@ -11,11 +11,23 @@ export interface Deps {
   api: Api;
   store: Store<State, Action>;
   notify: Notify;
-  session: { scanGen: number; scanRun: Promise<unknown> | null; cleaning: boolean; restoring: boolean; cancelling: boolean };
+  session: {
+    scanGen: number;
+    scanRun: Promise<unknown> | null;
+    cleaning: boolean;
+    restoring: boolean;
+    cancelling: boolean;
+    loadingInitial: Promise<void> | null;
+  };
 }
 
 export function createDeps(api: Api, store: Store<State, Action>, notify: Notify): Deps {
-  return { api, store, notify, session: { scanGen: 0, scanRun: null, cleaning: false, restoring: false, cancelling: false } };
+  return {
+    api,
+    store,
+    notify,
+    session: { scanGen: 0, scanRun: null, cleaning: false, restoring: false, cancelling: false, loadingInitial: null },
+  };
 }
 
 /** Lỗi lệnh Tauri là chuỗi; "busy" đổi sang câu dễ hiểu, còn lại giữ nguyên văn. */
@@ -24,14 +36,25 @@ export function friendly(e: unknown): string {
   return m === 'busy' ? t('errors.busy') : m;
 }
 
+/** StrictMode chạy effect khởi động 2 lần ⇒ appInfo/diskFree bị gọi đôi nếu không chặn; giữ lại
+ * lời gọi đang chạy và trả cùng promise đó cho lần gọi chồng, giống các cờ `session` khác. */
 export async function loadInitial(d: Deps): Promise<void> {
+  if (d.session.loadingInitial) return d.session.loadingInitial;
+  const run = (async () => {
+    try {
+      const info = await d.api.appInfo();
+      d.store.dispatch({ type: 'APP_INFO', dryRun: info.dry_run, systemDrive: info.system_drive });
+    } catch (e) {
+      d.notify('warning', t('errors.appInfoFailed', { message: friendly(e) }));
+    }
+    await refreshFree(d);
+  })();
+  d.session.loadingInitial = run;
   try {
-    const info = await d.api.appInfo();
-    d.store.dispatch({ type: 'APP_INFO', dryRun: info.dry_run, systemDrive: info.system_drive });
-  } catch (e) {
-    d.notify('warning', t('errors.appInfoFailed', { message: friendly(e) }));
+    await run;
+  } finally {
+    if (d.session.loadingInitial === run) d.session.loadingInitial = null;
   }
-  await refreshFree(d);
 }
 
 export async function refreshFree(d: Deps): Promise<void> {
@@ -169,7 +192,7 @@ async function runClean(d: Deps): Promise<void> {
       if (g.error) {
         d.notify('warning', t('notice.groupFailed', { name: groupName(g.id), message: g.error }));
       } else if (g.report && g.report.errors.length > 0) {
-        d.notify('warning', t('notice.groupErrors', { name: groupName(g.id), count: g.report.errors.length, first: g.report.errors[0] }));
+        d.notify('warning', t('notice.groupErrors', { name: groupName(g.id), count: g.report.errors.length, first: noticeText(g.report.errors[0]) }));
       }
     }
     if (summary.log_write_failed) d.notify('warning', t('notice.logWriteFailed'));

@@ -44,4 +44,14 @@ describe('catalog', () => {
     expect(noticeText('browser_running:coccoc')).toContain('Cốc Cốc');
     expect(noticeText('ma_la')).toBe('ma_la');
   });
+
+  it('dịch mã thông báo gốc bị loại và gốc không đọc được, giữ nguyên cả đường dẫn có dấu ":"', () => {
+    const path = 'C:\\Users\\a\\AppData\\Local\\Temp';
+    const rejected = noticeText(`root_rejected:${path}`);
+    expect(rejected).toContain(path);
+    expect(rejected).not.toContain('root_rejected:');
+    const unreadable = noticeText(`root_unreadable:${path}`);
+    expect(unreadable).toContain(path);
+    expect(unreadable).not.toContain('root_unreadable:');
+  });
 });
