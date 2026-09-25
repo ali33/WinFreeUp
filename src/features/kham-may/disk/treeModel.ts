@@ -81,18 +81,33 @@ export function applyDelete(m: TreeModel, id: number, removed: Removed): TreeMod
   if (parentId === undefined) return m;
   const ancestors = new Set<number>();
   for (let cur: number | undefined = parentId; cur !== undefined; cur = m.parentOf[cur]) ancestors.add(cur);
+  // Mục bị xóa và mọi con cháu đã tải: dọn trang, quan hệ cha và cờ mở, không để rác trong bộ nhớ.
+  const gone = new Set<number>([id]);
+  for (const k of Object.keys(m.parentOf)) {
+    const start = Number(k);
+    for (let cur: number | undefined = start; cur !== undefined; cur = m.parentOf[cur]) {
+      if (cur === id) {
+        gone.add(start);
+        break;
+      }
+    }
+  }
   const pages: Record<number, ChildrenPage> = {};
   for (const [k, page] of Object.entries(m.pages)) {
     const pid = Number(k);
-    if (pid === id) continue;
+    if (gone.has(pid)) continue;
     let items = page.items.map((it) => (ancestors.has(it.id) ? minus(it, removed) : it));
     if (pid === parentId) items = items.filter((it) => it.id !== id);
     pages[pid] = { ...page, parent: ancestors.has(pid) ? minus(page.parent, removed) : page.parent, items };
   }
   const root = m.root && ancestors.has(m.root.id) ? minus(m.root, removed) : m.root;
   const parentOf = { ...m.parentOf };
-  delete parentOf[id];
-  return { ...m, root, pages, parentOf };
+  const expanded = { ...m.expanded };
+  for (const g of gone) {
+    delete parentOf[g];
+    delete expanded[g];
+  }
+  return { ...m, root, pages, parentOf, expanded };
 }
 
 /** hiberfil.sys ngay dưới gốc một ổ ⇒ hiện gợi ý tắt ngủ đông. */

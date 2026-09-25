@@ -8,6 +8,9 @@ import {
   DialogSurface,
   DialogTitle,
   Field,
+  MessageBar,
+  MessageBarActions,
+  MessageBarBody,
   ProgressBar,
   Select,
 } from '@fluentui/react-components';
@@ -37,6 +40,10 @@ function isCancelled(e: unknown): boolean {
   return e === 'cancelled' || (e instanceof Error && e.message === 'cancelled');
 }
 
+/** Lõi từ chối xóa vì lý do người dùng tự xử lý được trong Explorer (OneDrive, ổ không có Thùng rác…):
+ *  hiện câu dễ hiểu kèm nút «Mở trong Explorer» thay vì chỉ báo lỗi. */
+const SELF_DELETE_CODES = new Set(['onedrive', 'no_recycle_bin', 'recycle_disabled', 'redirected_path']);
+
 function pickDefault(vols: VolumeInfo[]): string {
   return (vols.find((v) => v.root.toUpperCase() === 'C:\\') ?? vols[0])?.root ?? '';
 }
@@ -54,6 +61,7 @@ export function DiskView({ api, notify }: { api: KhamMayApi; notify: Notify }) {
   const [deleting, setDeleting] = useState(false);
   const [status, setStatus] = useState('');
   const [guide, setGuide] = useState(false);
+  const [selfDelete, setSelfDelete] = useState<{ node: NodeView; message: string } | null>(null);
   const alive = useRef(true);
 
   useEffect(() => {
@@ -95,15 +103,24 @@ export function DiskView({ api, notify }: { api: KhamMayApi; notify: Notify }) {
     setProgress(null);
     setStatus('');
     setElapsed(null);
+    setSelfDelete(null);
     try {
       const sum = await api.diskScan(selected, (s) => alive.current && setProgress(s));
       if (!alive.current) return;
       const slow = walkReasonText(sum.plan);
       if (slow) notify('warning', slow);
-      setTree(startTree(sum.root));
+      // Tải tầng đầu TRƯỚC, rồi thay cả cây một lần: tới lúc đó cây cũ vẫn mờ dưới lớp phủ.
+      // Tầng đầu hỏng thì vẫn thay gốc (cây cũ đã hết hạn ở lõi), báo hổ phách, có nút Thử lại.
+      let next = startTree(sum.root);
+      try {
+        next = withPage(next, await api.treeChildren(sum.root.id));
+      } catch (e) {
+        if (alive.current) notify('warning', tk('km.disk.loadFailed', { message: friendly(e) }));
+      }
+      if (!alive.current) return;
+      setTree(next);
       setElapsed(sum.elapsed_ms);
       setPhase('done');
-      await loadChildren(sum.root.id);
     } catch (e) {
       if (!alive.current) return;
       setPhase(tree.root ? 'done' : 'idle');
@@ -119,7 +136,7 @@ export function DiskView({ api, notify }: { api: KhamMayApi; notify: Notify }) {
       // Hủy không được thì lượt quét vẫn chạy: trả nút Hủy lại để bấm lần nữa.
       if (!alive.current) return;
       setPhase((p) => (p === 'cancelling' ? 'scanning' : p));
-      notify('warning', friendly(e));
+      notify('warning', tk('km.disk.cancelFailed', { message: friendly(e) }));
     }
   }
 
@@ -137,16 +154,16 @@ export function DiskView({ api, notify }: { api: KhamMayApi; notify: Notify }) {
     try {
       await api.diskReveal(n.id);
     } catch (e) {
-      notify('warning', tk('km.disk.revealFailed', { message: friendly(e) }));
+      if (alive.current) notify('warning', tk('km.disk.revealFailed', { message: friendly(e) }));
     }
   }
 
   async function copy(n: NodeView) {
     try {
       await api.copyText(n.path);
-      setStatus(tk('km.disk.copied'));
+      if (alive.current) setStatus(tk('km.disk.copied'));
     } catch (e) {
-      notify('warning', tk('km.disk.copyFailed', { message: friendly(e) }));
+      if (alive.current) notify('warning', tk('km.disk.copyFailed', { message: friendly(e) }));
     }
   }
 
@@ -154,16 +171,23 @@ export function DiskView({ api, notify }: { api: KhamMayApi; notify: Notify }) {
     const n = confirm;
     if (!n) return;
     setDeleting(true);
+    setSelfDelete(null);
     try {
       const r = await api.diskDelete(n.id);
+      if (!alive.current) return;
       setTree((t) => applyDelete(t, n.id, r.removed));
       setStatus(tk('km.disk.deleted', { name: n.name, size: formatBytes(r.removed.bytes) }));
       if (r.log_error) notify('warning', tk('km.err.logWrite', { message: r.log_error }));
     } catch (e) {
-      notify('error', tk('km.disk.deleteFailed', { name: n.name, message: friendly(e) }));
+      if (!alive.current) return;
+      const message = tk('km.disk.deleteFailed', { name: n.name, message: friendly(e) });
+      if (typeof e === 'string' && SELF_DELETE_CODES.has(e)) setSelfDelete({ node: n, message });
+      else notify('error', message);
     } finally {
-      setDeleting(false);
-      setConfirm(null);
+      if (alive.current) {
+        setDeleting(false);
+        setConfirm(null);
+      }
     }
   }
 
@@ -223,6 +247,17 @@ export function DiskView({ api, notify }: { api: KhamMayApi; notify: Notify }) {
         {status}
       </p>
 
+      {selfDelete && (
+        <MessageBar intent="warning" role="alert">
+          <MessageBarBody>{selfDelete.message}</MessageBarBody>
+          <MessageBarActions>
+            <Button size="small" disabled={busyScan} onClick={() => void reveal(selfDelete.node)}>
+              {tk('km.disk.reveal')}
+            </Button>
+          </MessageBarActions>
+        </MessageBar>
+      )}
+
       {/* Quét lại hoặc đang mở một tầng: giữ cây cũ mờ dưới lớp phủ (lớp phủ chặn bấm), không xoá trắng. */}
       {tree.root && (
         <div className="km-overlay-host" aria-busy={busyScan || loadingNode !== null}>
@@ -251,6 +286,15 @@ export function DiskView({ api, notify }: { api: KhamMayApi; notify: Notify }) {
                 <td />
                 <td />
               </tr>
+              {!tree.pages[tree.root.id] && loadingNode === null && !busyScan && (
+                <tr>
+                  <td colSpan={5}>
+                    <Button size="small" onClick={() => tree.root && void loadChildren(tree.root.id)}>
+                      {tk('km.common.retry')}
+                    </Button>
+                  </td>
+                </tr>
+              )}
               {rows.map((r) =>
                 r.kind === 'rest' ? (
                   <tr key={`rest-${r.parentId}`}>
@@ -305,16 +349,16 @@ export function DiskView({ api, notify }: { api: KhamMayApi; notify: Notify }) {
                     <td className="km-muted">{formatDate(r.node.modified)}</td>
                     <td>
                       <div className="km-row-actions">
-                        <Button size="small" appearance="subtle" onClick={() => void reveal(r.node)}>
+                        <Button size="small" appearance="subtle" disabled={busyScan} onClick={() => void reveal(r.node)}>
                           {tk('km.disk.reveal')}
                         </Button>
-                        <Button size="small" appearance="subtle" onClick={() => void copy(r.node)}>
+                        <Button size="small" appearance="subtle" disabled={busyScan} onClick={() => void copy(r.node)}>
                           {tk('km.disk.copy')}
                         </Button>
                         <Button
                           size="small"
                           appearance="subtle"
-                          disabled={r.node.protected || deleting || busyScan}
+                          disabled={r.node.protected || deleting || busyScan || loadingNode !== null}
                           title={r.node.protected ? tk('km.disk.protected') : undefined}
                           onClick={() => setConfirm(r.node)}
                         >

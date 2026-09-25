@@ -2,8 +2,8 @@ import { describe, expect, it, vi } from 'vitest';
 import { act, configure, fireEvent, render, screen, within } from '@testing-library/react';
 import { FluentProvider, webLightTheme } from '@fluentui/react-components';
 import type { ReactNode } from 'react';
-import type { KhamMayApi, ScanSummary } from '../api/types';
-import { deferred, fakeApi, ROOT } from '../testing/fakeApi';
+import type { ChildrenPage, KhamMayApi, ScanSummary } from '../api/types';
+import { deferred, fakeApi, GB, node, PAGES, ROOT } from '../testing/fakeApi';
 import { DiskView, walkReasonText } from './DiskView';
 
 // Hộp thoại Fluent vẽ chậm khi nhiều file test chạy song song trên máy yếu: nới thời gian chờ findBy*.
@@ -100,8 +100,81 @@ describe('Ổ đĩa', () => {
     const { notify } = setup({ diskScan: vi.fn(() => run.promise), diskScanCancel: vi.fn(async () => Promise.reject('no_scan')) });
     fireEvent.click(await screen.findByRole('button', { name: 'Quét' }));
     fireEvent.click(await screen.findByRole('button', { name: 'Hủy' }));
-    await vi.waitFor(() => expect(notify).toHaveBeenCalledWith('warning', 'no_scan'));
+    await vi.waitFor(() => expect(notify).toHaveBeenCalledWith('warning', 'Không hủy được: no_scan'));
     expect((screen.getByRole('button', { name: 'Hủy' }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('hủy dạng Error("cancelled") cũng không báo lỗi', async () => {
+    const { notify } = setup({ diskScan: vi.fn(async () => Promise.reject(new Error('cancelled'))) });
+    fireEvent.click(await screen.findByRole('button', { name: 'Quét' }));
+    await screen.findByRole('button', { name: 'Quét' });
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it('quét lại thành công: tải tầng đầu xong mới thay cả cây, trước đó cây cũ vẫn mờ dưới lớp phủ', async () => {
+    const page0 = deferred<ChildrenPage>();
+    const { api } = await scanned();
+    const newRoot = node(0, 'C:\\', 50 * GB, { path: 'C:\\', protected: true });
+    vi.mocked(api.diskScan).mockImplementationOnce(async () => ({ root: newRoot, plan: { mode: 'mft' as const }, elapsed_ms: 1000 }));
+    vi.mocked(api.treeChildren).mockImplementationOnce(() => page0.promise);
+    fireEvent.click(screen.getByRole('button', { name: 'Quét lại' }));
+    await vi.waitFor(() => expect(api.treeChildren).toHaveBeenCalledTimes(2));
+    expect(screen.getByText('Users')).toBeTruthy();
+    expect(within(row('C:\\')).getByText('60 GB')).toBeTruthy();
+    expect(row('Users').closest('.km-overlay-host')?.getAttribute('aria-busy')).toBe('true');
+    await act(async () => page0.resolve({ parent: newRoot, items: [node(9, 'Games', 50 * GB)], rest: null }));
+    expect(await screen.findByText('Games')).toBeTruthy();
+    expect(screen.queryByText('Users')).toBeNull();
+    expect(within(row('C:\\')).getByText('50 GB')).toBeTruthy();
+  });
+
+  it('tải tầng đầu hỏng: vẫn thay gốc, báo hổ phách, có nút Thử lại', async () => {
+    let fail = true;
+    const { api, notify } = setup({
+      treeChildren: vi.fn(async (id: number) => {
+        if (fail) throw 'The device is not ready.';
+        return PAGES[id];
+      }),
+    });
+    fireEvent.click(await screen.findByRole('button', { name: 'Quét' }));
+    await vi.waitFor(() => expect(notify).toHaveBeenCalledWith('warning', 'Không mở được thư mục: The device is not ready.'));
+    expect(await screen.findByText('C:\\')).toBeTruthy();
+    fail = false;
+    fireEvent.click(await screen.findByRole('button', { name: 'Thử lại' }));
+    expect(await screen.findByText('Users')).toBeTruthy();
+    expect(api.treeChildren).toHaveBeenLastCalledWith(0);
+    expect(screen.queryByRole('button', { name: 'Thử lại' })).toBeNull();
+  });
+
+  it('xóa bị từ chối vì OneDrive: câu dễ hiểu kèm nút mở Explorer để tự xóa', async () => {
+    const { api } = await scanned({ diskDelete: vi.fn(async () => Promise.reject('onedrive')) });
+    await openTo('Users', 'an');
+    await screen.findByText('Downloads');
+    fireEvent.click(within(row('Downloads')).getByRole('button', { name: 'Xóa vào Thùng rác', hidden: true }));
+    fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Xóa vào Thùng rác', hidden: true }));
+    const bar = await screen.findByText(/Không xóa được «Downloads»: Mục này nằm trong OneDrive/);
+    const box = bar.closest('.fui-MessageBar') as HTMLElement;
+    fireEvent.click(within(box).getByRole('button', { name: 'Mở trong Explorer', hidden: true }));
+    await vi.waitFor(() => expect(api.diskReveal).toHaveBeenCalledWith(3));
+    expect(screen.getByText('Downloads')).toBeTruthy();
+  });
+
+  it('đang mở một tầng thì khóa nút xóa; đang quét thì khóa mở Explorer và chép đường dẫn', async () => {
+    const page = deferred<ChildrenPage>();
+    const run = deferred<ScanSummary>();
+    const { api } = await scanned();
+    vi.mocked(api.treeChildren).mockImplementationOnce(() => page.promise);
+    fireEvent.click(screen.getByRole('button', { name: 'Mở Users' }));
+    const dels = screen.getAllByRole('button', { name: 'Xóa vào Thùng rác', hidden: true });
+    expect(dels.every((b) => (b as HTMLButtonElement).disabled)).toBe(true);
+    await act(async () => page.resolve(PAGES[1]));
+    vi.mocked(api.diskScan).mockImplementationOnce(() => run.promise);
+    fireEvent.click(screen.getByRole('button', { name: 'Quét lại' }));
+    await screen.findByRole('button', { name: 'Hủy' });
+    for (const name of ['Mở trong Explorer', 'Sao chép đường dẫn']) {
+      expect(screen.getAllByRole('button', { name, hidden: true }).every((b) => (b as HTMLButtonElement).disabled)).toBe(true);
+    }
+    await act(async () => run.reject('cancelled'));
   });
 
   it('lỗi quét thật lên băng đỏ', async () => {

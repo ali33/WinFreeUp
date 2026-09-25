@@ -53,6 +53,17 @@ describe('cây phía giao diện', () => {
     expect(m.pages[3]).toBeUndefined();
   });
 
+  it('xóa một thư mục thì dọn luôn trang và quan hệ cha của mọi con cháu', () => {
+    const m = applyDelete(opened(), 2, { bytes: 30 * GB, files: 4 });
+    expect(m.pages[2]).toBeUndefined();
+    expect(m.pages[3]).toBeUndefined();
+    expect(m.parentOf[2]).toBeUndefined();
+    expect(m.parentOf[3]).toBeUndefined();
+    expect(m.parentOf[4]).toBeUndefined();
+    expect(m.expanded[3]).toBeUndefined();
+    expect(m.pages[1].items).toEqual([]);
+  });
+
   it('xóa một id không có trên màn thì không đổi gì', () => {
     const m = opened();
     expect(applyDelete(m, 999, { bytes: 1, files: 1 })).toBe(m);
