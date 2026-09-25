@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import type { Api, CleanSummary, GroupScan } from '../api/types';
+import type { Api, CleanSummary, GroupScan, RestorePointStatus } from '../api/types';
 import { initialState, reducer } from './machine';
 import { createStore } from './store';
 import * as c from './controller';
@@ -113,6 +113,40 @@ describe('quét', () => {
     expect(store.getState().phase).toBe('welcome');
     expect(store.getState().groups).toEqual([]);
   });
+
+  it('gọi Quét hai lần liền không đợi lần đầu: lõi chỉ vào một lần, kết quả lần 1 vẫn tới Xem trước', async () => {
+    const run = deferred<GroupScan[]>();
+    const { d, store, api } = setup({
+      scanAll: vi.fn(() => run.promise),
+    });
+    const p1 = c.startScan(d);
+    const p2 = c.startScan(d);
+    run.resolve(SCANS);
+    await p1;
+    await p2;
+    expect(api.scanAll).toHaveBeenCalledTimes(1);
+    expect(store.getState().phase).toBe('preview');
+  });
+
+  it('gọi Hủy hai lần liền không đợi lần đầu: lõi chỉ nhận một lệnh hủy', async () => {
+    const cancel = deferred<void>();
+    const run = deferred<GroupScan[]>();
+    const { d, store, api } = setup({
+      scanAll: vi.fn(() => run.promise),
+      cancelScan: vi.fn(() => cancel.promise),
+    });
+    const scanning = c.startScan(d);
+    expect(store.getState().phase).toBe('scanning');
+    const p1 = c.cancelScan(d);
+    const p2 = c.cancelScan(d);
+    cancel.resolve();
+    run.resolve(SCANS);
+    await p1;
+    await p2;
+    await scanning;
+    expect(api.cancelScan).toHaveBeenCalledTimes(1);
+    expect(store.getState().phase).toBe('welcome');
+  });
 });
 
 describe('dọn', () => {
@@ -138,6 +172,25 @@ describe('dọn', () => {
     expect(api.clean).not.toHaveBeenCalled();
     await c.acceptConfirm(d);
     expect(api.prepareRestorePoint).toHaveBeenCalledWith(['user_temp', 'browser_cache', 'recycle_bin'], false);
+    expect(api.clean).toHaveBeenCalledTimes(1);
+    expect(store.getState().phase).toBe('result');
+  });
+
+  it('gọi đồng ý hai lần liền không đợi lần đầu: chỉ tạo điểm khôi phục một lần', async () => {
+    const restore = deferred<RestorePointStatus>();
+    const { d, store, api } = setup({
+      prepareRestorePoint: vi.fn(() => restore.promise),
+    });
+    await c.startScan(d);
+    c.toggle(d, 'recycle_bin');
+    await c.requestClean(d);
+    expect(store.getState().phase).toBe('confirm');
+    const p1 = c.acceptConfirm(d);
+    const p2 = c.acceptConfirm(d);
+    restore.resolve({ status: 'created' });
+    await p1;
+    await p2;
+    expect(api.prepareRestorePoint).toHaveBeenCalledTimes(1);
     expect(api.clean).toHaveBeenCalledTimes(1);
     expect(store.getState().phase).toBe('result');
   });

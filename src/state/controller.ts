@@ -11,11 +11,11 @@ export interface Deps {
   api: Api;
   store: Store<State, Action>;
   notify: Notify;
-  session: { scanGen: number; scanRun: Promise<unknown> | null; cleaning: boolean };
+  session: { scanGen: number; scanRun: Promise<unknown> | null; cleaning: boolean; restoring: boolean; cancelling: boolean };
 }
 
 export function createDeps(api: Api, store: Store<State, Action>, notify: Notify): Deps {
-  return { api, store, notify, session: { scanGen: 0, scanRun: null, cleaning: false } };
+  return { api, store, notify, session: { scanGen: 0, scanRun: null, cleaning: false, restoring: false, cancelling: false } };
 }
 
 /** Lỗi lệnh Tauri là chuỗi; "busy" đổi sang câu dễ hiểu, còn lại giữ nguyên văn. */
@@ -53,6 +53,7 @@ function reportScanIssues(d: Deps, groups: GroupScan[]): void {
 }
 
 export async function startScan(d: Deps): Promise<void> {
+  if (d.session.scanRun) return;
   d.store.dispatch({ type: 'SCAN_STARTED' });
   if (d.store.getState().phase !== 'scanning') return;
   const gen = ++d.session.scanGen;
@@ -76,17 +77,24 @@ export async function startScan(d: Deps): Promise<void> {
 
 /** Giữ vòng quay «Đang hủy…» cho tới khi lõi dừng hẳn, để lần Quét kế tiếp không bị «busy». */
 export async function cancelScan(d: Deps): Promise<void> {
-  if (d.store.getState().phase !== 'scanning') return;
-  d.store.dispatch({ type: 'SCAN_CANCEL_REQUESTED' });
-  d.session.scanGen++;
-  const run = d.session.scanRun;
+  if (d.store.getState().phase !== 'scanning' || d.session.cancelling) return;
+  d.session.cancelling = true;
   try {
-    await d.api.cancelScan();
-  } catch (e) {
-    d.notify('warning', friendly(e));
+    d.store.dispatch({ type: 'SCAN_CANCEL_REQUESTED' });
+    d.session.scanGen++;
+    const run = d.session.scanRun;
+    try {
+      await d.api.cancelScan();
+    } catch (e) {
+      // KHÔNG có khoá i18n hợp nghĩa cho "hủy quét thất bại" (errors.scanFailed nói về quét,
+      // không phải hủy) và vi.json dùng chung, không được thêm khoá mới — giữ nguyên câu gốc.
+      d.notify('warning', friendly(e));
+    }
+    if (run) await run.catch(() => undefined);
+    d.store.dispatch({ type: 'SCAN_ABORTED' });
+  } finally {
+    d.session.cancelling = false;
   }
-  if (run) await run.catch(() => undefined);
-  d.store.dispatch({ type: 'SCAN_ABORTED' });
 }
 
 export function toggle(d: Deps, id: string): void {
@@ -118,20 +126,25 @@ export function abortAfterRestoreFailure(d: Deps): void {
 
 async function advance(d: Deps): Promise<void> {
   const s = d.store.getState();
-  if (s.phase === 'restorePoint' && s.restore === null) return runRestore(d);
+  if (s.phase === 'restorePoint' && s.restore === null && !d.session.restoring) return runRestore(d);
   if (s.phase === 'cleaning' && s.summary === null && !d.session.cleaning) return runClean(d);
 }
 
 async function runRestore(d: Deps): Promise<void> {
-  const s = d.store.getState();
-  let status: RestorePointStatus;
+  d.session.restoring = true;
   try {
-    status = await d.api.prepareRestorePoint(s.selected, s.dryRun);
-  } catch (e) {
-    status = { status: 'failed', message: friendly(e) };
+    const s = d.store.getState();
+    let status: RestorePointStatus;
+    try {
+      status = await d.api.prepareRestorePoint(s.selected, s.dryRun);
+    } catch (e) {
+      status = { status: 'failed', message: friendly(e) };
+    }
+    d.store.dispatch({ type: 'RESTORE_RESULT', status });
+    await advance(d);
+  } finally {
+    d.session.restoring = false;
   }
-  d.store.dispatch({ type: 'RESTORE_RESULT', status });
-  await advance(d);
 }
 
 async function runClean(d: Deps): Promise<void> {
