@@ -95,14 +95,27 @@ fn is_policy_path(path: &str) -> bool {
 
 /// Trạng thái cả mục và các lỗi đọc (nguyên văn). Lỗi đọc một thao tác ⇒ tính là `Differ`.
 pub fn tweak_status(t: &Tweak, sys: &SystemInfo, ops: &dyn TweakOps, undo: &UndoStore) -> (TweakStatus, Vec<String>) {
-    if let Err(reason) = supported(t, sys) {
-        // App không có trên máy thì ẩn luôn, kể cả khi sai build — «không hỗ trợ» chỉ hiện cho thứ đang có.
-        let absent = t.group == Group::Bloatware
-            && t.ops.iter().enumerate().all(|(i, op)| matches!(op_state(ops, op, undo.get(&t.id, i).is_some()), Ok(OpState::Missing)));
-        let status = if absent { TweakStatus::NotPresent } else { TweakStatus::Unsupported { reason } };
-        return (status, vec![]);
-    }
     let mut errors = Vec::new();
+    // Sai build/edition mà WinFreeUp đã từng áp dụng (có ảnh chụp, vd nâng Win 10 lên 11 hay đổi edition)
+    // ⇒ tính trạng thái thật như thường để mục vẫn hoàn tác được.
+    if let (Err(reason), false) = (supported(t, sys), undo.has_any(&t.id)) {
+        // App không có trên máy thì ẩn luôn, kể cả khi sai build — «không hỗ trợ» chỉ hiện cho thứ đang có.
+        let mut absent = t.group == Group::Bloatware;
+        if absent {
+            for (i, op) in t.ops.iter().enumerate() {
+                match op_state(ops, op, undo.get(&t.id, i).is_some()) {
+                    Ok(OpState::Missing) => {}
+                    Ok(_) => absent = false,
+                    Err(e) => {
+                        errors.push(format!("{}#{i}: {e}", t.id));
+                        absent = false;
+                    }
+                }
+            }
+        }
+        let status = if absent { TweakStatus::NotPresent } else { TweakStatus::Unsupported { reason } };
+        return (status, errors);
+    }
     let mut states = Vec::with_capacity(t.ops.len());
     for (i, op) in t.ops.iter().enumerate() {
         let had = undo.get(&t.id, i).is_some();
@@ -110,7 +123,7 @@ pub fn tweak_status(t: &Tweak, sys: &SystemInfo, ops: &dyn TweakOps, undo: &Undo
             if let Op::RegistrySet { path, name, value_type, value, .. } = op {
                 if is_policy_path(path) {
                     match (ops.reg_read(path, name), to_reg_data(*value_type, value)) {
-                        (Ok(Some(cur)), Ok(target)) if cur != target => return (TweakStatus::Managed, vec![]),
+                        (Ok(Some(cur)), Ok(target)) if cur != target => return (TweakStatus::Managed, errors),
                         _ => {}
                     }
                 }
@@ -200,6 +213,28 @@ level = "basic"
 risk = "safe"
 windows = { min_build = 19041 }
 ops = [ { kind = "appx_remove", package_family = "A.App_1", store_product_id = "9P1J8S7CCWWT" } ]
+
+[[tweak]]
+id = "mixed"
+group = "privacy"
+level = "recommended"
+risk = "safe"
+windows = { min_build = 19041 }
+ops = [
+  { kind = "registry_set", path = 'HKCU\B', name = "x", type = "dword", value = 0, default = 1 },
+  { kind = "registry_set", path = 'HKLM\SOFTWARE\Policies\M', name = "v", type = "dword", value = 1, default = "absent" },
+]
+
+[[tweak]]
+id = "app_reg"
+group = "bloatware"
+level = "basic"
+risk = "safe"
+windows = { min_build = 30000 }
+ops = [
+  { kind = "appx_remove", package_family = "A.App_1", store_product_id = "9P1J8S7CCWWT" },
+  { kind = "registry_set", path = 'HKCU\C', name = "z", type = "dword", value = 0, default = "absent" },
+]
 "#;
 
     fn cat() -> Vec<Tweak> {
@@ -299,6 +334,45 @@ ops = [ { kind = "appx_remove", package_family = "A.App_1", store_product_id = "
         let (s, errs) = tweak_status(&t, &f.sys, &f, &u);
         assert_eq!(s, TweakStatus::Partial);
         assert_eq!(errs, vec![r"two_values#0: fake failure: reg_read:HKCU\A|x".to_string()]);
+    }
+
+    #[test]
+    fn unsupported_but_applied_by_us_reports_real_state_so_it_can_be_reverted() {
+        let (_d, mut u) = empty_undo();
+        let t = tw("recall");
+        let mut f = FakeOps::default().with_reg(r"HKLM\SOFTWARE\Policies\R", "v", RegData::Dword(1));
+        f.sys.build = 22631;
+        // Chưa từng áp dụng ⇒ vẫn «không hỗ trợ».
+        assert_eq!(tweak_status(&t, &f.sys, &f, &u).0, TweakStatus::Unsupported { reason: "build_min:26100".into() });
+        // Đã áp dụng (có ảnh chụp) rồi đổi build/edition ⇒ tính trạng thái thật để còn hoàn tác.
+        u.record_if_absent("recall", 0, Snapshot::Registry { data: None });
+        assert_eq!(tweak_status(&t, &f.sys, &f, &u).0, TweakStatus::Applied);
+        let mut g = FakeOps::default();
+        g.sys.build = 22631;
+        assert_eq!(tweak_status(&t, &g.sys, &g, &u).0, TweakStatus::NotApplied);
+    }
+
+    #[test]
+    fn managed_status_keeps_read_errors() {
+        let (_d, u) = empty_undo();
+        let t = tw("mixed");
+        let mut f = FakeOps::default()
+            .with_reg(r"HKLM\SOFTWARE\Policies\M", "v", RegData::Dword(3))
+            .failing(r"reg_read:HKCU\B|x");
+        f.sys.managed = true;
+        let (s, errs) = tweak_status(&t, &f.sys, &f, &u);
+        assert_eq!(s, TweakStatus::Managed);
+        assert_eq!(errs, vec![r"mixed#0: fake failure: reg_read:HKCU\B|x".to_string()]);
+    }
+
+    #[test]
+    fn unsupported_bloatware_read_errors_are_reported() {
+        let (_d, u) = empty_undo();
+        let t = tw("app_reg");
+        let f = FakeOps::default().failing(r"reg_read:HKCU\C|z");
+        let (s, errs) = tweak_status(&t, &f.sys, &f, &u);
+        assert_eq!(s, TweakStatus::Unsupported { reason: "build_min:30000".into() });
+        assert_eq!(errs, vec![r"app_reg#1: fake failure: reg_read:HKCU\C|z".to_string()]);
     }
 
     #[test]
