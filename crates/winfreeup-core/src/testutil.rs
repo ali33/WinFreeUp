@@ -25,6 +25,8 @@ pub struct FakeSys {
     pub dism_fails: bool,
     pub recycle: (u64, u64),
     pub restore_error: Option<String>,
+    /// `Some(msg)` ⇒ `take_ownership` trả `Err(System(msg))` (sau khi đã ghi lời gọi).
+    pub own_error: Option<String>,
 }
 
 impl FakeSys {
@@ -82,7 +84,10 @@ impl SystemOps for FakeSys {
     }
     fn take_ownership(&self, path: &Path) -> Result<()> {
         self.record(format!("own:{}", path.display()));
-        Ok(())
+        match &self.own_error {
+            Some(m) => Err(CoreError::System(m.clone())),
+            None => Ok(()),
+        }
     }
 }
 
