@@ -1,7 +1,9 @@
 //! Danh mục nhúng vào exe và luật kiểm danh mục (spec mục 7 «Danh mục»). Danh mục sai ⇒ test đỏ ⇒ CI đỏ.
 use std::collections::HashSet;
 
-use crate::blocklist::{is_blocked_package, is_forbidden_reg_path, is_forbidden_service};
+use crate::blocklist::{
+    is_blocked_package, is_forbidden_reg_path, is_forbidden_service, is_forbidden_task, is_forbidden_value_name,
+};
 use crate::model::{default_data, parse_catalog, to_reg_data, Group, Op, RegValue, Tweak, ABSENT};
 
 pub const CATALOG_TOML: &str = include_str!("../catalog.toml");
@@ -60,9 +62,10 @@ pub fn validate(catalog: &[Tweak], has_key: &dyn Fn(&str) -> bool) -> Vec<String
                 errs.push(format!("{id}#{i}: bloatware tweaks hold only appx_remove, privacy tweaks never do"));
             }
             match op {
-                Op::RegistrySet { path, value_type, value, default, .. } => {
-                    check_path(id, i, path, &mut errs);
-                    // `"absent"` chỉ có nghĩa ở `default` — ở `value` (kể cả kiểu sz) là lỗi viết danh mục.
+                Op::RegistrySet { path, name, value_type, value, default } => {
+                    check_path(id, i, path, name, &mut errs);
+                    // Quy ước `"absent"`: ở `default` LUÔN nghĩa là «mặc định không có value» (kể cả kiểu sz —
+                    // không bao giờ là chuỗi chữ "absent"); ở `value` thì bị cấm, vì không ghi được «không có value».
                     if matches!(value, RegValue::Str(s) if s == ABSENT) {
                         errs.push(format!("{id}#{i}: value must not be \"{ABSENT}\" (only default may be)"));
                     } else if let Err(e) = to_reg_data(*value_type, value) {
@@ -72,7 +75,7 @@ pub fn validate(catalog: &[Tweak], has_key: &dyn Fn(&str) -> bool) -> Vec<String
                         errs.push(format!("{id}#{i}: default: {e}"));
                     }
                 }
-                Op::RegistryDelete { path, .. } => check_path(id, i, path, &mut errs),
+                Op::RegistryDelete { path, name } => check_path(id, i, path, name, &mut errs),
                 Op::ServiceStartup { service, .. } => {
                     if is_forbidden_service(service) {
                         errs.push(format!("{id}#{i}: service {service} is off-limits"));
@@ -82,10 +85,15 @@ pub fn validate(catalog: &[Tweak], has_key: &dyn Fn(&str) -> bool) -> Vec<String
                     if !task.starts_with('\\') {
                         errs.push(format!("{id}#{i}: task path must start with \\"));
                     }
+                    if is_forbidden_task(task) {
+                        errs.push(format!("{id}#{i}: task {task} is off-limits"));
+                    }
                 }
                 Op::AppxRemove { package_family, store_product_id } => {
-                    if !package_family.contains('_') {
-                        errs.push(format!("{id}#{i}: package_family must be Name_PublisherId"));
+                    if !is_package_family(package_family) {
+                        errs.push(format!(
+                            "{id}#{i}: package_family must be Name_PublisherId (one '_', PublisherId 13 chars [a-z0-9])"
+                        ));
                     }
                     if is_blocked_package(package_family) {
                         errs.push(format!("{id}#{i}: {package_family} is on the do-not-remove list"));
@@ -100,13 +108,28 @@ pub fn validate(catalog: &[Tweak], has_key: &dyn Fn(&str) -> bool) -> Vec<String
     errs
 }
 
-fn check_path(id: &str, i: usize, path: &str, errs: &mut Vec<String>) {
+/// `Name_PublisherId`: đúng một `_`, tên không rỗng, PublisherId 13 ký tự `[a-z0-9]`.
+fn is_package_family(s: &str) -> bool {
+    match s.split_once('_') {
+        Some((name, publisher)) => {
+            !name.is_empty()
+                && publisher.len() == 13
+                && publisher.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
+fn check_path(id: &str, i: usize, path: &str, name: &str, errs: &mut Vec<String>) {
     let upper = path.to_ascii_uppercase();
     if !(upper.starts_with("HKCU\\") || upper.starts_with("HKLM\\")) {
         errs.push(format!("{id}#{i}: path must start with HKCU\\ or HKLM\\"));
     }
     if is_forbidden_reg_path(path) {
         errs.push(format!("{id}#{i}: path {path} is off-limits"));
+    }
+    if is_forbidden_value_name(name) {
+        errs.push(format!("{id}#{i}: value name {name} is off-limits"));
     }
 }
 
@@ -191,6 +214,41 @@ mod tests {
         let e = one(&format!("{p}ops = [{{ kind = \"registry_set\", path = 'HKCU\\Software\\X', name = \"n\", type = \"sz\", value = \"absent\", default = \"absent\" }}]"));
         assert!(e.iter().any(|m| m.contains("value must not be \"absent\"")), "{e:?}");
         let e = one(&format!("{p}ops = [{{ kind = \"registry_set\", path = 'HKCU\\Software\\X', name = \"n\", type = \"sz\", value = \"on\", default = \"absent\" }}]"));
+        assert!(e.is_empty(), "{e:?}");
+    }
+
+    /// Khoá quy ước: `default = "absent"` luôn là «không có value», kể cả với kiểu sz — không bao giờ là chuỗi chữ.
+    #[test]
+    fn absent_default_means_no_value_even_for_sz() {
+        let c = parse_catalog("[[tweak]]\nid = \"z\"\ngroup = \"privacy\"\nlevel = \"basic\"\nrisk = \"safe\"\nwindows = { min_build = 19041 }\nops = [{ kind = \"registry_set\", path = 'HKCU\\Software\\X', name = \"n\", type = \"sz\", value = \"on\", default = \"absent\" }]").unwrap();
+        let Op::RegistrySet { value_type, default, .. } = &c[0].ops[0] else { panic!("registry_set") };
+        assert_eq!(default_data(*value_type, default).unwrap(), None);
+    }
+
+    /// Lệch kế hoạch có chủ ý (lượt rà Task 2): validate dùng lưới cấm đụng mới.
+    #[test]
+    fn forbidden_value_names_services_paths_and_tasks_are_rejected() {
+        let p = "[[tweak]]\nid = \"y\"\ngroup = \"privacy\"\nlevel = \"basic\"\nrisk = \"safe\"\nwindows = { min_build = 19041 }\n";
+        let e = one(&format!("{p}ops = [{{ kind = \"registry_set\", path = 'HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\System', name = \"EnableSmartScreen\", type = \"dword\", value = 0, default = \"absent\" }}]"));
+        assert!(e.iter().any(|m| m.contains("value name EnableSmartScreen is off-limits")), "{e:?}");
+        let e = one(&format!("{p}ops = [{{ kind = \"registry_delete\", path = 'HKLM\\SOFTWARE\\X', name = \"noautoupdate\" }}]"));
+        assert!(e.iter().any(|m| m.contains("off-limits")), "{e:?}");
+        let e = one(&format!("{p}ops = [{{ kind = \"registry_set\", path = 'HKLM\\SYSTEM\\CurrentControlSet\\Services\\WdFilter', name = \"Start\", type = \"dword\", value = 4, default = 0 }}]"));
+        assert!(e.iter().any(|m| m.contains("off-limits")), "{e:?}");
+        let e = one(&format!("{p}ops = [{{ kind = \"service_startup\", service = \"webthreatdefusersvc_3a1b2\", start = \"disabled\", default = \"manual\" }}]"));
+        assert!(e.iter().any(|m| m.contains("off-limits")), "{e:?}");
+        let e = one(&format!("{p}ops = [{{ kind = \"scheduled_task_disable\", task = '\\Microsoft\\Windows\\UpdateOrchestrator\\Schedule Scan' }}]"));
+        assert!(e.iter().any(|m| m.contains("task") && m.contains("off-limits")), "{e:?}");
+    }
+
+    /// Lệch kế hoạch có chủ ý (lượt rà Task 2): `package_family` đúng một `_`, PublisherId 13 ký tự `[a-z0-9]`.
+    #[test]
+    fn package_family_shape_is_checked() {
+        for bad in ["A.B_1", "A_B_8wekyb3d8bbwe", "A.B_8WEKYB3D8BBWE", "A.B_8wekyb3d8bbw"] {
+            let e = one(&format!("{HEAD}ops = [{{ kind = \"appx_remove\", package_family = \"{bad}\", store_product_id = \"9P1J8S7CCWWT\" }}]"));
+            assert!(e.iter().any(|m| m.contains("package_family")), "{bad}: {e:?}");
+        }
+        let e = one(&format!("{HEAD}ops = [{{ kind = \"appx_remove\", package_family = \"A.B_8wekyb3d8bbwe\", store_product_id = \"9P1J8S7CCWWT\" }}]"));
         assert!(e.is_empty(), "{e:?}");
     }
 
