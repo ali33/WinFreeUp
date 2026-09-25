@@ -8,7 +8,7 @@ use serde::Serialize;
 use crate::blocklist::is_blocked_package;
 use crate::model::{default_data, to_reg_data, Group, Level, Op, Restart, Risk, StartType, Tweak};
 use crate::ops::{SystemInfo, TweakOps};
-use crate::state::{supported, tweak_status, TweakStatus};
+use crate::state::{op_state, supported, tweak_status, OpState, TweakStatus};
 use crate::undo::{Snapshot, UndoStore};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -57,6 +57,15 @@ pub struct RunReport {
 pub enum TweakEvent {
     Started { id: String, index: usize, total: usize },
     Finished { outcome: TweakOutcome },
+}
+
+/// Một lượt áp dụng/hoàn tác tại một thời điểm (cùng file ảnh chụp, cùng máy).
+static RUN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Id đưa vào lỗi/nhật ký: id lạ (không có trong danh mục) chỉ được echo nếu đúng dạng id danh mục.
+fn shown_id(id: &str) -> String {
+    let ok = (1..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+    if ok { id.to_string() } else { "<invalid>".into() }
 }
 
 fn load_undo(path: &Path, notices: &mut Vec<String>) -> UndoStore {
@@ -116,10 +125,11 @@ fn apply_op(ops: &dyn TweakOps, undo: &mut UndoStore, id: &str, i: usize, op: &O
         }
         Op::RegistryDelete { path, name } => {
             let cur = ops.reg_read(path, name)?;
-            if cur.is_none() {
+            let absent = cur.is_none();
+            snapshot(undo, id, i, Snapshot::Registry { data: cur })?;
+            if absent {
                 return Ok(false);
             }
-            snapshot(undo, id, i, Snapshot::Registry { data: cur })?;
             ops.reg_delete(path, name)?;
             Ok(true)
         }
@@ -147,9 +157,18 @@ fn apply_op(ops: &dyn TweakOps, undo: &mut UndoStore, id: &str, i: usize, op: &O
             Ok(true)
         }
         Op::AppxRemove { package_family, .. } => {
+            if is_blocked_package(package_family) {
+                return Err(format!("blocked:{package_family}"));
+            }
             let mut changed = false;
+            let mut blocked = false;
             for p in ops.packages(package_family)? {
+                // Phòng thủ: lớp thật lọc lỏng (vd theo tên) thì không gỡ nhầm gói khác family.
+                if !p.family.eq_ignore_ascii_case(package_family) {
+                    continue;
+                }
                 if is_blocked_package(&p.family) || p.is_framework || p.non_removable {
+                    blocked = true;
                     errors.push(format!("{id}#{i}: blocked:{}", p.family));
                     continue;
                 }
@@ -159,9 +178,13 @@ fn apply_op(ops: &dyn TweakOps, undo: &mut UndoStore, id: &str, i: usize, op: &O
                     Err(e) => errors.push(format!("{id}#{i}: {e}")),
                 }
             }
-            if all_users {
-                if let Err(e) = ops.deprovision(package_family) {
-                    errors.push(format!("{id}#{i}: {e}"));
+            if all_users && !blocked {
+                // Gỡ khỏi ảnh cài đặt cũng cần đường quay lại (nút «Cài lại từ Store»), kể cả khi
+                // tài khoản hiện tại không có gói.
+                snapshot(undo, id, i, Snapshot::Appx { family: package_family.clone() })?;
+                match ops.deprovision(package_family) {
+                    Ok(()) => changed = true,
+                    Err(e) => errors.push(format!("{id}#{i}: {e}")),
                 }
             }
             Ok(changed)
@@ -170,8 +193,10 @@ fn apply_op(ops: &dyn TweakOps, undo: &mut UndoStore, id: &str, i: usize, op: &O
 }
 
 enum Reverted {
-    /// Đã trả về như trước ⇒ xoá ảnh chụp của thao tác.
+    /// Đã ghi lại giá trị cũ ⇒ xoá ảnh chụp của thao tác; máy có đổi.
     Done,
+    /// Máy đã ở giá trị cũ sẵn (người dùng tự trả, app đã cài lại…) ⇒ chỉ xoá ảnh chụp, máy không đổi.
+    Cleared,
     /// Không làm gì (không có gì để trả).
     Nothing,
     /// Đã mở trang Store; giữ ảnh chụp cho tới khi app được cài lại.
@@ -180,13 +205,21 @@ enum Reverted {
 
 /// `store_seen`: ProductId đã mở trang Store trong lượt này — nhiều gói cùng ProductId (vd Game Bar
 /// 3 gói) chỉ mở một lần; các thao tác sau vẫn giữ ảnh chụp.
+/// Không có ảnh chụp ⇒ chỉ trả `default` khi thao tác đang ở đích (`Match`); giá trị khác đích là
+/// của người dùng/công cụ khác, không đụng.
 fn revert_op(ops: &dyn TweakOps, snap: Option<&Snapshot>, op: &Op, store_seen: &mut BTreeSet<String>) -> Result<Reverted, String> {
+    if snap.is_none() && !matches!(op, Op::RegistryDelete { .. } | Op::AppxRemove { .. }) && op_state(ops, op, false)? != OpState::Match {
+        return Ok(Reverted::Nothing);
+    }
     match op {
         Op::RegistrySet { path, name, value_type, default, .. } => {
             let want = match snap {
                 Some(Snapshot::Registry { data }) => data.clone(),
                 _ => default_data(*value_type, default)?,
             };
+            if ops.reg_read(path, name)? == want {
+                return Ok(Reverted::Cleared);
+            }
             match want {
                 Some(d) => ops.reg_write(path, name, &d)?,
                 None => ops.reg_delete(path, name)?,
@@ -194,36 +227,41 @@ fn revert_op(ops: &dyn TweakOps, snap: Option<&Snapshot>, op: &Op, store_seen: &
             Ok(Reverted::Done)
         }
         Op::RegistryDelete { path, name } => match snap {
-            Some(Snapshot::Registry { data: Some(d) }) => ops.reg_write(path, name, d).map(|_| Reverted::Done),
-            Some(_) => Ok(Reverted::Done),
+            Some(Snapshot::Registry { data: Some(d) }) => {
+                if ops.reg_read(path, name)?.as_ref() == Some(d) {
+                    return Ok(Reverted::Cleared);
+                }
+                ops.reg_write(path, name, d).map(|_| Reverted::Done)
+            }
+            Some(_) => Ok(Reverted::Cleared),
             None => Err("no_snapshot".into()),
         },
         Op::ServiceStartup { service, default, .. } => {
-            if ops.service_start(service)?.is_none() {
-                return Ok(Reverted::Nothing);
-            }
+            let Some(cur) = ops.service_start(service)? else { return Ok(Reverted::Nothing) };
             let want = match snap {
                 Some(Snapshot::Service { start }) => *start,
                 _ => *default,
             };
+            if cur == want {
+                return Ok(Reverted::Cleared);
+            }
             ops.set_service_start(service, want).map(|_| Reverted::Done)
         }
         Op::ScheduledTaskDisable { task } => {
-            if ops.task_enabled(task)?.is_none() {
-                return Ok(Reverted::Nothing);
-            }
+            let Some(cur) = ops.task_enabled(task)? else { return Ok(Reverted::Nothing) };
             let want = match snap {
                 Some(Snapshot::Task { enabled }) => *enabled,
                 _ => true,
             };
-            if want {
-                ops.set_task_enabled(task, true)?;
+            if !want || cur {
+                return Ok(Reverted::Cleared);
             }
+            ops.set_task_enabled(task, true)?;
             Ok(Reverted::Done)
         }
         Op::AppxRemove { package_family, store_product_id } => {
             if !ops.packages(package_family)?.is_empty() {
-                return Ok(Reverted::Done);
+                return Ok(Reverted::Cleared);
             }
             if snap.is_none() || store_seen.contains(store_product_id) {
                 return Ok(Reverted::Nothing);
@@ -242,18 +280,25 @@ enum Mode {
 }
 
 fn run(catalog: &[Tweak], ops: &dyn TweakOps, undo_path: &Path, ids: &[String], mode: Mode, on_event: &dyn Fn(&TweakEvent)) -> RunReport {
+    // Hai lượt chồng nhau (bấm hai lần, hai cửa sổ) sẽ đọc-ghi chéo file ảnh chụp.
+    let _guard = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Id trùng chỉ chạy một lần (giữ thứ tự lần đầu): hoàn tác lần hai sẽ không còn ảnh chụp.
+    let mut unique = BTreeSet::new();
+    let ids: Vec<&String> = ids.iter().filter(|id| unique.insert(id.as_str())).collect();
     let mut notices = Vec::new();
     let mut undo = load_undo(undo_path, &mut notices);
     let mut outcomes = Vec::new();
     let mut restart = Restart::None;
     let sys = ops.system_info();
     let mut store_seen = BTreeSet::new();
-    for (index, id) in ids.iter().enumerate() {
-        on_event(&TweakEvent::Started { id: id.clone(), index, total: ids.len() });
+    for (index, &id) in ids.iter().enumerate() {
+        let tweak = catalog.iter().find(|t| &t.id == id);
+        let shown = if tweak.is_some() { id.clone() } else { shown_id(id) };
+        on_event(&TweakEvent::Started { id: shown.clone(), index, total: ids.len() });
         let mut errors = Vec::new();
         let mut store_opened = Vec::new();
-        let outcome = match (catalog.iter().find(|t| &t.id == id), &sys) {
-            (None, _) => TweakOutcome { id: id.clone(), status: TweakStatus::NotApplied, errors: vec![format!("{id}: unknown_id")], store_opened },
+        let outcome = match (tweak, &sys) {
+            (None, _) => TweakOutcome { id: shown.clone(), status: TweakStatus::NotApplied, errors: vec![format!("{shown}: unknown_id")], store_opened },
             (_, Err(e)) => TweakOutcome { id: id.clone(), status: TweakStatus::NotApplied, errors: vec![format!("{id}: {e}")], store_opened },
             (Some(t), Ok(sys)) => {
                 let (before, _) = tweak_status(t, sys, ops, &undo);
@@ -280,6 +325,7 @@ fn run(catalog: &[Tweak], ops: &dyn TweakOps, undo_path: &Path, ids: &[String], 
                                         changed = true;
                                         undo.remove(id, i);
                                     }
+                                    Ok(Reverted::Cleared) => undo.remove(id, i),
                                     Ok(Reverted::Nothing) => {}
                                     Ok(Reverted::StoreOpened(pid)) => store_opened.push(pid),
                                     Err(e) => errors.push(format!("{id}#{i}: {e}")),
@@ -377,6 +423,14 @@ level = "basic"
 risk = "safe"
 windows = { min_build = 19041 }
 ops = [ { kind = "appx_remove", package_family = "A.App_1", store_product_id = "9P1J8S7CCWWT" } ]
+
+[[tweak]]
+id = "del"
+group = "privacy"
+level = "basic"
+risk = "safe"
+windows = { min_build = 19041 }
+ops = [ { kind = "registry_delete", path = 'HKCU\D', name = "z" } ]
 
 [[tweak]]
 id = "gamebar"
@@ -550,12 +604,170 @@ ops = [
 
     #[test]
     fn framework_or_system_packages_are_never_removed_even_if_catalog_says_so() {
+        for all_users in [false, true] {
+            for (is_framework, non_removable) in [(false, true), (true, false)] {
+                let e = env();
+                let f = FakeOps::default();
+                f.packages.lock().unwrap().push(PackageInfo { full_name: "A.App_1!1".into(), family: "A.App_1".into(), is_framework, non_removable });
+                let r = apply(&e.cat, &f, &e.undo, &ids(&["app"]), all_users, &quiet);
+                assert_eq!(r.outcomes[0].errors, vec!["app#0: blocked:A.App_1".to_string()]);
+                assert!(f.calls().is_empty(), "all_users={all_users}: {:?} — gói bị chặn thì cũng không deprovision", f.calls());
+            }
+        }
+    }
+
+    #[test]
+    fn all_users_snapshots_then_deprovisions_even_when_current_user_lacks_the_package() {
+        let e = env();
+        let f = FakeOps::default().with_package("G.One_1");
+        let r = apply(&e.cat, &f, &e.undo, &ids(&["gamebar"]), true, &quiet);
+        assert!(r.outcomes[0].errors.is_empty(), "{:?}", r.outcomes[0].errors);
+        assert!(f.calls().contains(&"deprovision:G.Two_1".to_string()));
+        let (u, _) = UndoStore::load(&e.undo);
+        assert!((0..3).all(|i| u.get("gamebar", i).is_some()), "deprovision cũng phải có ảnh chụp để còn nút Cài lại");
+    }
+
+    #[test]
+    fn deprovision_not_run_when_snapshot_cannot_be_saved() {
+        let e = env();
+        std::fs::write(e.undo.parent().unwrap(), "x").unwrap();
+        let f = FakeOps::default().with_package("G.One_1");
+        apply(&e.cat, &f, &e.undo, &ids(&["gamebar"]), true, &quiet);
+        assert!(f.calls().is_empty(), "{:?}", f.calls());
+    }
+
+    /// FakeOps nhưng `packages()` trả MỌI gói, không lọc theo family — mô phỏng lớp thật lọc lỏng.
+    struct LoosePackages(FakeOps);
+
+    impl TweakOps for LoosePackages {
+        fn reg_read(&self, p: &str, n: &str) -> Result<Option<RegData>, String> {
+            self.0.reg_read(p, n)
+        }
+        fn reg_write(&self, p: &str, n: &str, d: &RegData) -> Result<(), String> {
+            self.0.reg_write(p, n, d)
+        }
+        fn reg_delete(&self, p: &str, n: &str) -> Result<(), String> {
+            self.0.reg_delete(p, n)
+        }
+        fn service_start(&self, n: &str) -> Result<Option<StartType>, String> {
+            self.0.service_start(n)
+        }
+        fn set_service_start(&self, n: &str, s: StartType) -> Result<(), String> {
+            self.0.set_service_start(n, s)
+        }
+        fn stop_service(&self, n: &str) -> Result<(), String> {
+            self.0.stop_service(n)
+        }
+        fn task_enabled(&self, p: &str) -> Result<Option<bool>, String> {
+            self.0.task_enabled(p)
+        }
+        fn set_task_enabled(&self, p: &str, e: bool) -> Result<(), String> {
+            self.0.set_task_enabled(p, e)
+        }
+        fn packages(&self, _family: &str) -> Result<Vec<PackageInfo>, String> {
+            Ok(self.0.packages.lock().unwrap().clone())
+        }
+        fn remove_package(&self, n: &str, a: bool) -> Result<(), String> {
+            self.0.remove_package(n, a)
+        }
+        fn deprovision(&self, f: &str) -> Result<(), String> {
+            self.0.deprovision(f)
+        }
+        fn open_uri(&self, u: &str) -> Result<(), String> {
+            self.0.open_uri(u)
+        }
+        fn system_info(&self) -> Result<SystemInfo, String> {
+            self.0.system_info()
+        }
+        fn restart_explorer(&self) -> Result<(), String> {
+            self.0.restart_explorer()
+        }
+    }
+
+    #[test]
+    fn packages_of_another_family_are_never_removed() {
+        let e = env();
+        let f = LoosePackages(FakeOps::default().with_package("A.App_1").with_package("B.Other_1"));
+        apply(&e.cat, &f, &e.undo, &ids(&["app"]), false, &quiet);
+        assert_eq!(f.0.calls(), vec!["remove_package:A.App_1!1:false"]);
+    }
+
+    #[test]
+    fn revert_without_snapshot_leaves_values_not_at_target_alone() {
+        let e = env();
+        // x đang ở đích (0) ⇒ trả default; y người dùng tự đặt 5 ⇒ không đụng.
+        let f = FakeOps::default()
+            .with_reg(r"HKCU\A", "x", RegData::Dword(0))
+            .with_reg(r"HKCU\A", "y", RegData::Dword(5))
+            .with_service("DiagTrack", StartType::Manual)
+            .with_task(r"\T\One", true);
+        let r = revert(&e.cat, &f, &e.undo, &ids(&["reg", "svc", "task"]), &quiet);
+        assert!(r.outcomes.iter().all(|o| o.errors.is_empty()), "{:?}", r.outcomes);
+        assert_eq!(f.get(r"HKCU\A", "x"), Some(RegData::Dword(1)));
+        assert_eq!(f.get(r"HKCU\A", "y"), Some(RegData::Dword(5)));
+        assert_eq!(f.calls(), vec![r"reg_write:HKCU\A|x"], "dịch vụ/tác vụ không ở đích ⇒ không đụng");
+    }
+
+    #[test]
+    fn duplicate_ids_run_once() {
+        let e = env();
+        let f = FakeOps::default().with_reg(r"HKCU\A", "x", RegData::Dword(7));
+        apply(&e.cat, &f, &e.undo, &ids(&["reg"]), false, &quiet);
+        let seen = Mutex::new(Vec::new());
+        let r = revert(&e.cat, &f, &e.undo, &ids(&["reg", "task", "reg"]), &|ev| {
+            if let TweakEvent::Started { id, index, total } = ev {
+                seen.lock().unwrap().push(format!("{id} {index}/{total}"));
+            }
+        });
+        assert_eq!(r.outcomes.len(), 2);
+        assert_eq!(*seen.lock().unwrap(), vec!["reg 0/2", "task 1/2"]);
+        assert_eq!(f.get(r"HKCU\A", "x"), Some(RegData::Dword(7)));
+    }
+
+    #[test]
+    fn revert_that_only_clears_snapshots_needs_no_restart() {
+        let e = env();
+        let f = FakeOps::default().with_reg(r"HKCU\A", "x", RegData::Dword(7));
+        apply(&e.cat, &f, &e.undo, &ids(&["reg"]), false, &quiet);
+        // Người dùng tự trả tay về như cũ.
+        f.reg_write(r"HKCU\A", "x", &RegData::Dword(7)).unwrap();
+        f.reg_delete(r"HKCU\A", "y").unwrap();
+        let before = f.calls().len();
+        let r = revert(&e.cat, &f, &e.undo, &ids(&["reg"]), &quiet);
+        assert!(r.outcomes[0].errors.is_empty(), "{:?}", r.outcomes[0].errors);
+        assert_eq!(r.restart, Restart::None, "máy không đổi gì ⇒ không nhắc khởi động lại Explorer");
+        assert_eq!(f.calls().len(), before, "giá trị đã đúng ⇒ không ghi");
+        let (u, _) = UndoStore::load(&e.undo);
+        assert!(!u.has_any("reg"), "vẫn dọn ảnh chụp");
+    }
+
+    #[test]
+    fn runs_hold_the_global_lock() {
         let e = env();
         let f = FakeOps::default();
-        f.packages.lock().unwrap().push(PackageInfo { full_name: "A.App_1!1".into(), family: "A.App_1".into(), is_framework: false, non_removable: true });
-        let r = apply(&e.cat, &f, &e.undo, &ids(&["app"]), false, &quiet);
-        assert_eq!(r.outcomes[0].errors, vec!["app#0: blocked:A.App_1".to_string()]);
+        apply(&e.cat, &f, &e.undo, &ids(&["reg"]), false, &|_| {
+            assert!(RUN_LOCK.try_lock().is_err(), "đang chạy thì khoá phải bị giữ");
+        });
+    }
+
+    #[test]
+    fn registry_delete_of_absent_value_is_still_snapshotted() {
+        let e = env();
+        let f = FakeOps::default();
+        apply(&e.cat, &f, &e.undo, &ids(&["del"]), false, &quiet);
+        let (u, _) = UndoStore::load(&e.undo);
+        assert_eq!(u.get("del", 0), Some(&Snapshot::Registry { data: None }));
         assert!(f.calls().is_empty());
+    }
+
+    #[test]
+    fn invalid_ids_are_not_echoed() {
+        let e = env();
+        let f = FakeOps::default();
+        let r = apply(&e.cat, &f, &e.undo, &ids(&["Bad id\nTWEAK APPLY x OK"]), false, &quiet);
+        assert_eq!(r.outcomes[0].id, "<invalid>");
+        assert_eq!(r.outcomes[0].errors, vec!["<invalid>: unknown_id".to_string()]);
+        assert!(log_lines("APPLY", &r).iter().all(|l| !l.contains('\n')));
     }
 
     #[test]
