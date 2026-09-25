@@ -192,13 +192,13 @@ fn apply_op(ops: &dyn TweakOps, undo: &mut UndoStore, id: &str, i: usize, op: &O
                     }
                 };
                 changed |= deprovisioned;
-                // Lượt này không gỡ được gì mà ảnh chụp là mới ⇒ bỏ, kẻo mục hiện «Đã gỡ» và hoàn tác
-                // mở Store cho thứ WinFreeUp chưa từng gỡ.
-                if fresh && !changed {
-                    undo.remove(id, i);
-                    if let Err(e) = undo.save() {
-                        errors.push(format!("{id}#{i}: undo_save: {e}"));
-                    }
+            }
+            // Lượt này không gỡ được gì mà ảnh chụp là mới ⇒ bỏ, kẻo mục hiện «Đã gỡ» và hoàn tác mở
+            // Store cho thứ WinFreeUp chưa từng gỡ. Ảnh chụp từ lượt trước (`fresh` = false) giữ nguyên.
+            if fresh && !changed {
+                undo.remove(id, i);
+                if let Err(e) = undo.save() {
+                    errors.push(format!("{id}#{i}: undo_save: {e}"));
                 }
             }
             Ok(changed)
@@ -320,11 +320,12 @@ fn run(catalog: &[Tweak], ops: &dyn TweakOps, undo_path: &Path, ids: &[String], 
             (_, Err(e)) => TweakOutcome { id: id.clone(), status: TweakStatus::NotApplied, errors: vec![format!("{id}: {e}")], store_opened },
             (Some(t), Ok(sys)) => {
                 let (before, _) = tweak_status(t, sys, ops, &undo);
-                // Mục «không hỗ trợ» (sai build/edition…) mà có ảnh chụp ⇒ chỉ cho hoàn tác, không cho
-                // áp dụng lại.
+                // Mục «không hỗ trợ» (sai build/edition…) hoặc «tổ chức quản lý» mà có ảnh chụp ⇒ chỉ cho
+                // hoàn tác, không cho áp dụng lại. Thao tác không ảnh chụp và khác đích vẫn không bị đụng
+                // (`revert_op` trả `Nothing`).
                 let allowed = match mode {
                     Mode::Apply { .. } => before.actionable() && supported(t, sys).is_ok(),
-                    Mode::Revert => before.actionable() || (matches!(before, TweakStatus::Unsupported { .. }) && undo.has_any(id)),
+                    Mode::Revert => before.actionable() || (matches!(before, TweakStatus::Unsupported { .. } | TweakStatus::Managed) && undo.has_any(id)),
                 };
                 if !allowed {
                     errors.push(format!("{id}: not_allowed"));
@@ -378,7 +379,7 @@ pub fn apply(catalog: &[Tweak], ops: &dyn TweakOps, undo_path: &Path, ids: &[Str
     run(catalog, ops, undo_path, ids, Mode::Apply { all_users }, on_event)
 }
 
-/// Hoàn tác các mục `ids` (trùng ⇒ chạy một lần), kể cả mục «không hỗ trợ» còn ảnh chụp. `on_event`
+/// Hoàn tác các mục `ids` (trùng ⇒ chạy một lần), kể cả mục «không hỗ trợ»/«tổ chức quản lý» còn ảnh chụp. `on_event`
 /// KHÔNG được gọi lại `apply`/`revert` (khoá `RUN_LOCK` không vào lại được ⇒ treo).
 pub fn revert(catalog: &[Tweak], ops: &dyn TweakOps, undo_path: &Path, ids: &[String], on_event: &dyn Fn(&TweakEvent)) -> RunReport {
     run(catalog, ops, undo_path, ids, Mode::Revert, on_event)
@@ -911,6 +912,61 @@ ops = [
         assert_eq!(f.get(r"HKLM\SOFTWARE\Policies\R", "v"), None, "hoàn tác vẫn được");
         let (u, _) = UndoStore::load(&e.undo);
         assert!(!u.has_any("recall"));
+    }
+
+    #[test]
+    fn managed_with_partial_snapshot_reverts_only_snapshotted_ops() {
+        let e = env();
+        let cat = parse_catalog(
+            r#"
+[[tweak]]
+id = "pol"
+group = "privacy"
+level = "basic"
+risk = "safe"
+windows = { min_build = 19041 }
+ops = [
+  { kind = "registry_set", path = 'HKLM\SOFTWARE\Policies\P', name = "a", type = "dword", value = 1, default = "absent" },
+  { kind = "registry_set", path = 'HKLM\SOFTWARE\Policies\P', name = "b", type = "dword", value = 1, default = "absent" },
+]
+"#,
+        )
+        .unwrap();
+        // #0 WinFreeUp đã áp dụng (có ảnh chụp: vốn không có); #1 tổ chức đặt khác đích, không ảnh chụp.
+        let (mut u, _) = UndoStore::load(&e.undo);
+        u.record_if_absent("pol", 0, Snapshot::Registry { data: None });
+        u.save().unwrap();
+        let mut f = FakeOps::default().with_reg(r"HKLM\SOFTWARE\Policies\P", "a", RegData::Dword(1)).with_reg(r"HKLM\SOFTWARE\Policies\P", "b", RegData::Dword(0));
+        f.sys.managed = true;
+        let (u, _) = UndoStore::load(&e.undo);
+        assert_eq!(tweak_status(&cat[0], &f.sys, &f, &u).0, TweakStatus::Managed);
+        let r = apply(&cat, &f, &e.undo, &ids(&["pol"]), false, &quiet);
+        assert_eq!(r.outcomes[0].errors, vec!["pol: not_allowed".to_string()]);
+        assert!(f.calls().is_empty(), "Managed ⇒ không áp dụng");
+        let r = revert(&cat, &f, &e.undo, &ids(&["pol"]), &quiet);
+        assert!(r.outcomes[0].errors.is_empty(), "{:?}", r.outcomes[0].errors);
+        assert_eq!(f.get(r"HKLM\SOFTWARE\Policies\P", "a"), None, "#0 trả về ảnh chụp");
+        assert_eq!(f.get(r"HKLM\SOFTWARE\Policies\P", "b"), Some(RegData::Dword(0)), "#1 là của tổ chức ⇒ không đụng");
+        let (u, _) = UndoStore::load(&e.undo);
+        assert!(!u.has_any("pol"), "dọn ảnh chụp #0");
+    }
+
+    #[test]
+    fn current_user_removal_that_failed_drops_fresh_snapshot_but_keeps_old_one() {
+        let e = env();
+        let f = FakeOps::default().with_package("A.App_1").failing("remove_package:A.App_1!1:false");
+        let r = apply(&e.cat, &f, &e.undo, &ids(&["app"]), false, &quiet);
+        assert_eq!(r.outcomes[0].errors, vec!["app#0: fake failure: remove_package:A.App_1!1:false".to_string()]);
+        assert_eq!(r.outcomes[0].status, TweakStatus::NotApplied);
+        let (u, _) = UndoStore::load(&e.undo);
+        assert!(!u.has_any("app"), "không gỡ được gì ⇒ không để lại ảnh chụp mới");
+        // Ảnh chụp có từ lượt trước ⇒ giữ.
+        let (mut u, _) = UndoStore::load(&e.undo);
+        u.record_if_absent("app", 0, Snapshot::Appx { family: "A.App_1".into() });
+        u.save().unwrap();
+        apply(&e.cat, &f, &e.undo, &ids(&["app"]), false, &quiet);
+        let (u, _) = UndoStore::load(&e.undo);
+        assert!(u.get("app", 0).is_some(), "ảnh chụp từ lượt trước không bị xoá");
     }
 
     #[test]
