@@ -1,0 +1,23 @@
+[package]
+name = "winfreeup-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_UI_Shell",
+] }
+
+[dev-dependencies]
+tempfile = "3"
+filetime = "0.2"
+junction = "2"
+serde_json = "1"

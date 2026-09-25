@@ -1,1 +1,5 @@
 .omc/
+
+target/
+node_modules/
+dist/
