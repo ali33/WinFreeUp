@@ -5,12 +5,29 @@ import { friendly } from '../fmt';
 import { tk } from '../i18n';
 import { Spin } from '../ui/Spin';
 
-/** Danh sách app khởi động với công tắc bật/tắt (ghi StartupApproved như Task Manager, bật lại được). */
-export function StartupList({ api, notify, onChanged }: { api: KhamMayApi; notify: Notify; onChanged?: () => void }) {
+/**
+ * Danh sách app khởi động với công tắc bật/tắt (ghi StartupApproved như Task Manager, bật lại được).
+ * `onChanged(n)`: đổi xong, `n` = số app đang bật; `null` khi danh sách đọc thiếu nguồn (không đủ để đếm).
+ */
+export function StartupList({
+  api,
+  notify,
+  onChanged,
+}: {
+  api: KhamMayApi;
+  notify: Notify;
+  onChanged?: (enabled: number | null) => void;
+}) {
   const [entries, setEntries] = useState<StartupEntry[] | null>(null);
   const [failed, setFailed] = useState<string | null>(null);
   const [pending, setPending] = useState<Record<string, boolean>>({});
   const alive = useRef(true);
+  // notify giữ trong ref: App tạo lại notify thì không đọc lại danh sách.
+  const notifyRef = useRef(notify);
+  notifyRef.current = notify;
+  // Bản mới nhất của danh sách cho các lần bật/tắt nối nhau (closure của lần render cũ có thể đã cũ).
+  const entriesRef = useRef<StartupEntry[]>([]);
+  const complete = useRef(false);
 
   useEffect(() => {
     // Cờ riêng từng lần chạy effect: StrictMode chạy effect hai lần, lần đầu bị bỏ thì không được báo lỗi trùng.
@@ -20,32 +37,38 @@ export function StartupList({ api, notify, onChanged }: { api: KhamMayApi; notif
       .startupList()
       .then((l) => {
         if (!live) return;
+        entriesRef.current = l.entries;
+        complete.current = l.errors.length === 0;
         setEntries(l.entries);
         setFailed(null);
-        for (const e of l.errors) notify('warning', tk('km.startup.failed', { message: e }));
+        for (const e of l.errors) notifyRef.current('warning', tk('km.startup.failed', { message: e }));
       })
       .catch((e) => {
         if (!live) return;
         const message = tk('km.startup.failed', { message: friendly(e) });
+        entriesRef.current = [];
+        complete.current = false;
         setEntries([]);
         setFailed(message);
-        notify('error', message);
+        notifyRef.current('error', message);
       });
     return () => {
       live = false;
       alive.current = false;
     };
-  }, [api, notify]);
+  }, [api]);
 
   async function toggle(e: StartupEntry, enabled: boolean) {
     if (pending[e.id]) return;
     setPending((p) => ({ ...p, [e.id]: true }));
     try {
       const updated = await api.startupSet(e.id, enabled);
-      if (alive.current) setEntries((list) => (list ?? []).map((x) => (x.id === e.id ? { ...x, enabled: updated.enabled } : x)));
-      onChanged?.();
+      const next = entriesRef.current.map((x) => (x.id === e.id ? { ...x, enabled: updated.enabled } : x));
+      entriesRef.current = next;
+      if (alive.current) setEntries(next);
+      onChanged?.(complete.current ? next.filter((x) => x.enabled).length : null);
     } catch (err) {
-      notify('error', tk('km.startup.setFailed', { name: e.name, message: friendly(err) }));
+      notifyRef.current('error', tk('km.startup.setFailed', { name: e.name, message: friendly(err) }));
     } finally {
       if (alive.current) setPending((p) => ({ ...p, [e.id]: false }));
     }

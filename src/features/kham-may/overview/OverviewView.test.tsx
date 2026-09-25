@@ -29,13 +29,15 @@ function findingRow(id: string): HTMLElement {
 
 describe('Tổng quan', () => {
   it('khám đúng một lần kể cả StrictMode, hiện 9 dòng theo thứ tự bảng', async () => {
-    const { api } = setup();
+    const { api, notify } = setup();
     await screen.findByText(/Ổ hệ thống chỉ còn 9,5% trống/);
     expect(api.healthCheck).toHaveBeenCalledTimes(1);
     expect(api.healthThrottle).toHaveBeenCalledTimes(1);
     const ids = Array.from(document.querySelectorAll('[data-finding]')).map((e) => e.getAttribute('data-finding'));
     expect(ids).toEqual(['disk_full', 'disk_health', 'system_hdd', 'ram_pressure', 'startup_apps', 'uptime', 'power_saver', 'cpu_throttle', 'cpu_hot']);
     expect(await screen.findByText('0 vấn đề nghiêm trọng · 2 vấn đề nên xử lý')).toBeTruthy();
+    await screen.findByText('(1/2 đang bật)');
+    expect(notify).not.toHaveBeenCalledWith('error', expect.anything());
   });
 
   it('dòng nào xong hiện dòng đó; dòng chưa xong có vòng quay; hạ xung đo riêng 10 giây', async () => {
@@ -102,14 +104,76 @@ describe('Tổng quan', () => {
     );
     expect(within(findingRow('disk_full')).getByText('⚪ Không đo được')).toBeTruthy();
     await vi.waitFor(() => expect(document.querySelectorAll('[data-finding] [role="progressbar"]').length).toBe(0));
+    expect(screen.queryByText('Không thấy vấn đề nào.')).toBeNull();
+    expect(screen.getByText('Có mục chưa đo được — xem lý do ở từng dòng.')).toBeTruthy();
   });
 
-  it('khám lại xoá kết quả cũ và chạy lại', async () => {
-    const { api } = setup();
+  it('dòng lõi không trả kết quả thì «Không đo được» với lý do rõ', async () => {
+    setup({ healthCheck: vi.fn(async () => [{ id: 'disk_full' as const, level: 'ok' as const, value: 40, detail: null }]) });
+    await vi.waitFor(() =>
+      expect(within(findingRow('disk_health')).getByText('Không đo được: Lõi không trả kết quả cho mục này.')).toBeTruthy(),
+    );
+    expect(within(findingRow('disk_health')).getByText('⚪ Không đo được')).toBeTruthy();
+    expect(screen.queryByText('Không thấy vấn đề nào.')).toBeNull();
+  });
+
+  it('mọi dòng Ổn thì mới hiện «Không thấy vấn đề nào.»', async () => {
+    const allOk: Finding[] = FINDINGS.map((f) => ({ ...f, level: 'ok' as const, detail: null, value: 1 }));
+    setup({ healthCheck: vi.fn(async () => allOk) });
+    expect(await screen.findByText('Không thấy vấn đề nào.')).toBeTruthy();
+    expect(screen.queryByText('Có mục chưa đo được — xem lý do ở từng dòng.')).toBeNull();
+  });
+
+  it('bật/tắt app khởi động thì dòng startup_apps cập nhật số đếm', async () => {
+    setup();
+    await screen.findByText('12 app tự chạy cùng máy — máy khởi động chậm và tốn RAM.');
+    fireEvent.click(await screen.findByRole('switch', { name: 'OneDrive' }));
+    expect(await within(findingRow('startup_apps')).findByText('0 app tự chạy cùng máy.')).toBeTruthy();
+    expect(within(findingRow('startup_apps')).getByText('🟢 Ổn')).toBeTruthy();
+  });
+
+  it('danh sách khởi động đọc thiếu nguồn thì không tự sửa số đếm', async () => {
+    setup({
+      startupList: vi.fn(async () => ({
+        entries: [{ id: 'hkcu_run:OneDrive', source: 'hkcu_run' as const, name: 'OneDrive', command: 'x', enabled: true }],
+        errors: ['RegOpenKeyExW: Access is denied.'],
+      })),
+    });
+    await screen.findByText('12 app tự chạy cùng máy — máy khởi động chậm và tốn RAM.');
+    fireEvent.click(await screen.findByRole('switch', { name: 'OneDrive' }));
+    await screen.findByText('(0/1 đang bật)');
+    expect(within(findingRow('startup_apps')).getByText('12 app tự chạy cùng máy — máy khởi động chậm và tốn RAM.')).toBeTruthy();
+  });
+
+  it('khám lại giữ kết quả cũ dưới lớp phủ mờ, dòng nào có kết quả mới thì thay dần', async () => {
+    const second = deferred<Finding[]>();
+    let push: (f: Finding) => void = () => {};
+    const healthCheck = vi.fn(async (cb: (f: Finding) => void) => {
+      FINDINGS.forEach(cb);
+      return FINDINGS;
+    });
+    const { api } = setup({ healthCheck });
     await screen.findByText(/9,5%/);
     await vi.waitFor(() => expect((screen.getByRole('button', { name: 'Khám lại' }) as HTMLButtonElement).disabled).toBe(false));
+    healthCheck.mockImplementationOnce((cb) => {
+      push = cb;
+      return second.promise;
+    });
     fireEvent.click(screen.getByRole('button', { name: 'Khám lại' }));
     await vi.waitFor(() => expect(api.healthCheck).toHaveBeenCalledTimes(2));
+    const list = document.querySelector('.km-findings') as HTMLElement;
+    expect(list.getAttribute('aria-busy')).toBe('true');
+    expect(document.querySelector('.km-overlay [role="progressbar"]')).toBeTruthy();
+    // Kết quả cũ vẫn còn, không xoá trắng.
+    expect(within(findingRow('disk_full')).getByText(/9,5%/)).toBeTruthy();
+    expect(within(findingRow('uptime')).getByText('🟢 Ổn')).toBeTruthy();
+    act(() => push({ id: 'disk_full', level: 'ok', value: 20, detail: null }));
+    expect(within(findingRow('disk_full')).getByText('Ổ hệ thống còn 20% trống.')).toBeTruthy();
+    await act(async () => second.resolve([{ id: 'disk_full', level: 'ok', value: 20, detail: null }]));
+    await vi.waitFor(() => expect(list.getAttribute('aria-busy')).toBe('false'));
+    expect(document.querySelector('.km-overlay')).toBeNull();
+    // Lần khám mới không trả dòng uptime ⇒ không giữ số cũ như thể vừa đo.
+    expect(within(findingRow('uptime')).getByText('Không đo được: Lõi không trả kết quả cho mục này.')).toBeTruthy();
   });
 });
 
@@ -161,6 +225,23 @@ describe('Danh sách khởi động', () => {
     expect(await screen.findByText('Không đọc được danh sách khởi động: RegOpenKeyExW: Access is denied.')).toBeTruthy();
     expect(screen.queryByText('Không có app nào tự chạy cùng máy.')).toBeNull();
     expect(notify).toHaveBeenCalledWith('error', 'Không đọc được danh sách khởi động: RegOpenKeyExW: Access is denied.');
+  });
+
+  it('notify đổi thì không đọc lại danh sách', async () => {
+    const api = fakeApi();
+    const { rerender } = render(
+      <FluentProvider theme={webLightTheme}>
+        <StartupList api={api} notify={vi.fn()} />
+      </FluentProvider>,
+    );
+    await screen.findByText('(1/2 đang bật)');
+    rerender(
+      <FluentProvider theme={webLightTheme}>
+        <StartupList api={api} notify={vi.fn()} />
+      </FluentProvider>,
+    );
+    await screen.findByText('(1/2 đang bật)');
+    expect(api.startupList).toHaveBeenCalledTimes(1);
   });
 
   it('một nguồn đọc không được thì băng hổ phách, phần còn lại vẫn hiện', async () => {
