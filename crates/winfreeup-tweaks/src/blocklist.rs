@@ -33,6 +33,7 @@ pub const BLOCKED_PACKAGES: &[&str] = &[
     "Microsoft.Winget.Source*",
     "Microsoft.HEIFImageExtension",
     "Microsoft.HEVCVideoExtension",
+    "Microsoft.MPEG2VideoExtension",
     "Microsoft.VP9VideoExtensions",
     "Microsoft.WebMediaExtensions",
     "Microsoft.WebpImageExtension",
@@ -57,7 +58,7 @@ pub const FORBIDDEN_REG_FRAGMENTS: &[&str] = &[
     r"\wuauserv",
     r"\WinDefend",
     r"\mpssvc",
-    r"\PolicyManager\",
+    r"\PolicyManager",
     r"\Microsoft\MRT",
 ];
 
@@ -89,6 +90,8 @@ pub const FORBIDDEN_TASK_FRAGMENTS: &[&str] = &[
     r"\WaaSMedic\",
     r"\InstallService\",
     r"\ExploitGuard\",
+    r"\AppID\SmartScreenSpecific",
+    r"\UpdateAssistant\",
 ];
 
 /// `Name_PublisherId` ⇒ `Name`. Chuỗi không có `_` thì trả nguyên.
@@ -194,6 +197,13 @@ mod tests {
         assert!(is_forbidden_task(r"\microsoft\windows\waasmedic\PerformRemediation"));
         assert!(is_forbidden_task(r"\Microsoft\Windows\ExploitGuard\ExploitGuard MDM policy Refresh"));
         assert!(!is_forbidden_task(r"\Microsoft\Windows\Customer Experience Improvement Program\Consolidator"));
+        assert!(is_forbidden_task(r"\Microsoft\Windows\AppID\SmartScreenSpecific"));
+        assert!(is_forbidden_task(r"\Microsoft\Windows\UpdateAssistant\UpdateAssistant"));
+        assert!(is_forbidden_reg_path(r"HKLM\SOFTWARE\Microsoft\PolicyManager"), "value ngay trong khoá PolicyManager");
+        assert!(is_forbidden_reg_path(r"HKLM\SYSTEM\CurrentControlSet\Services\BITS\"), "dấu \\ cuối");
+        assert!(is_forbidden_reg_path(r"hklm\system\currentcontrolset\services\wdfilter"), "chữ thường");
+        assert!(!is_forbidden_reg_path(r"HKLM\SYSTEM\CurrentControlSet\Services\BITSxyz"), "tên khác chung tiền tố");
+        assert!(is_blocked_package("Microsoft.MPEG2VideoExtension_8wekyb3d8bbwe"));
     }
 
     #[test]
