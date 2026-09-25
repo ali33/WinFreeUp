@@ -143,6 +143,29 @@ describe('dọn và kết quả', () => {
     expect(s.phase).toBe('preview');
   });
 
+  it('đo lại "trước" ngay khi dọn thất bại: freeBefore về null, không giữ số cũ', () => {
+    let s = run(preview(), { type: 'FREE_SPACE', bytes: 10 * GB }, { type: 'REQUEST_CLEAN' });
+    s = reducer(s, { type: 'FREE_BEFORE_FAILED' });
+    expect(s.freeBefore).toBeNull();
+    expect(s.freeFailed).toBe(true);
+  });
+
+  it('freeBefore null lúc CLEAN_DONE thì đánh dấu freeAfterFailed để màn Kết quả không kẹt vòng quay dù đo "sau" thành công', () => {
+    let s = run(preview(), { type: 'FREE_SPACE', bytes: 10 * GB }, { type: 'REQUEST_CLEAN' }, { type: 'FREE_BEFORE_FAILED' });
+    const result = { id: 'user_temp', report: { bytes_freed: GB, files_deleted: 3, skipped_locked: 1, errors: [], dry_run: false }, error: null };
+    s = reducer(s, { type: 'CLEAN_DONE', summary: { groups: [result], log_path: 'x.log', dry_run: false, log_write_failed: false } });
+    expect(s.phase).toBe('result');
+    expect(s.freeAfterFailed).toBe(true);
+    s = reducer(s, { type: 'FREE_AFTER', bytes: 999 });
+    expect(s.freeAfter).toBe(999);
+    expect(s.freeAfterFailed).toBe(true);
+  });
+
+  it('freeBefore còn hợp lệ lúc CLEAN_DONE thì freeAfterFailed vẫn khởi động false như cũ', () => {
+    const s = run(preview(), { type: 'FREE_SPACE', bytes: 10 * GB }, { type: 'REQUEST_CLEAN' }, { type: 'CLEAN_DONE', summary: { groups: [], log_path: 'x.log', dry_run: false, log_write_failed: false } });
+    expect(s.freeAfterFailed).toBe(false);
+  });
+
   it('về đầu giữ cờ chạy thử và ổ hệ thống', () => {
     const s = run(initialState, { type: 'APP_INFO', dryRun: true, systemDrive: 'D:\\' }, { type: 'SCAN_STARTED' }, { type: 'RESET' });
     expect(s.phase).toBe('welcome');

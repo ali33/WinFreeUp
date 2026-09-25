@@ -142,11 +142,16 @@ pub async fn clean(app: AppHandle, state: State<'_, Shared>, ids: Vec<String>, d
         let result = engine::run_clean(&st.cleaners, &env, &ids, &scans, &opts, &log_dir(&env.local_appdata), &|ev| {
             let _ = app.emit("clean-progress", ev);
         });
-        // Buộc quét lại trước lần dọn kế tiếp: id vừa dọn (kể cả dọn lỗi/not_scanned/unknown)
-        // không còn phản ánh đúng trạng thái ổ đĩa hiện tại.
-        if let Ok(mut map) = st.scans.lock() {
-            for id in &ids {
-                map.remove(id);
+        // Buộc quét lại trước lần dọn kế tiếp: id vừa dọn (kể cả dọn lỗi/not_scanned/unknown ở
+        // MỨC TỪNG NHÓM trong CleanSummary) không còn phản ánh đúng trạng thái ổ đĩa hiện tại.
+        // Nhưng nếu cả lệnh `run_clean` lỗi (vd CleanLog::create thất bại, chưa dọn gì) thì KHÔNG
+        // xoá scans: CLEAN_FAILED đưa người dùng về màn Xem trước với danh sách cũ, xoá scans ở
+        // đây sẽ khiến mọi nhóm báo not_scanned dù đĩa chưa đổi gì.
+        if result.is_ok() {
+            if let Ok(mut map) = st.scans.lock() {
+                for id in &ids {
+                    map.remove(id);
+                }
             }
         }
         result.map_err(|e| e.to_string())
