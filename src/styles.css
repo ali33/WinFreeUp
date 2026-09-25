@@ -1,0 +1,149 @@
+:root {
+  color-scheme: light dark;
+}
+
+html,
+body {
+  margin: 0;
+  font-family: 'Segoe UI Variable Text', 'Segoe UI', system-ui, sans-serif;
+}
+
+.wfu-root {
+  min-height: 100vh;
+}
+
+.wfu-app {
+  max-width: 880px;
+  margin: 0 auto;
+  padding: 16px 24px 32px;
+  display: grid;
+  gap: 16px;
+}
+
+.wfu-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.wfu-notices {
+  display: grid;
+  gap: 8px;
+}
+
+.wfu-busy {
+  display: inline-flex;
+  align-items: center;
+}
+
+.wfu-hero {
+  display: grid;
+  gap: 4px;
+}
+
+.wfu-hero-number {
+  font-size: 40px;
+  font-weight: 600;
+  line-height: 1.1;
+}
+
+.wfu-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.wfu-groups {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.wfu-group {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: start;
+  gap: 4px 12px;
+  padding: 10px 12px;
+  border-radius: 6px;
+  border: 1px solid color-mix(in srgb, currentColor 14%, transparent);
+}
+
+.wfu-group-main {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.wfu-group-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+}
+
+.wfu-group-desc,
+.wfu-muted {
+  opacity: 0.75;
+  font-size: 13px;
+}
+
+.wfu-group-size {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  text-align: right;
+}
+
+.wfu-items {
+  grid-column: 2 / 4;
+  margin: 4px 0 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 2px;
+  font-size: 12px;
+}
+
+.wfu-item {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.wfu-item-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: left;
+}
+
+.wfu-loi,
+.wfu-canhbao {
+  white-space: pre-wrap;
+}
+
+/* Giảm chuyển động: dừng quay nhưng KHÔNG bỏ tín hiệu — đổi sang nhịp mờ tỏ. */
+@media (prefers-reduced-motion: reduce) {
+  .wfu-busy .fui-Spinner__spinner,
+  .wfu-busy .fui-Spinner__spinnerTail {
+    animation: none !important;
+  }
+  .wfu-busy {
+    animation: wfu-pulse 1.4s ease-in-out infinite;
+  }
+}
+
+@keyframes wfu-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
