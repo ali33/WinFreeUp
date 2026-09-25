@@ -40,8 +40,9 @@ impl Point {
 }
 
 /// Hai mẫu kề nhau có liền mạch không (không có khoảng dừng lấy mẫu ở giữa).
+/// Đồng hồ lùi (`cur.t_ms < prev.t_ms`) ⇒ đứt đoạn.
 fn contiguous(prev: &Point, cur: &Point) -> bool {
-    cur.t_ms.saturating_sub(prev.t_ms) <= cur.dur_ms + cur.dur_ms / 2
+    cur.t_ms >= prev.t_ms && cur.t_ms - prev.t_ms <= cur.dur_ms + cur.dur_ms / 2
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -96,7 +97,10 @@ pub fn find_stutters(points: &[Point]) -> Vec<Span> {
             disk: slice.iter().any(|p| p.disk > STUTTER_PCT),
         };
         match out.last_mut() {
-            Some(prev) if span.start_ms.saturating_sub(prev.end_ms) < MERGE_GAP_MS => {
+            // Đồng hồ lùi (cơn sau bắt đầu trước khi cơn trước kết thúc) ⇒ không gộp.
+            Some(prev)
+                if span.start_ms >= prev.end_ms && span.start_ms - prev.end_ms < MERGE_GAP_MS =>
+            {
                 prev.end_ms = span.end_ms;
                 prev.last = span.last;
                 prev.cpu |= span.cpu;
@@ -122,7 +126,7 @@ pub fn find_throttle(points: &[Point]) -> Vec<Span> {
             cpu: true,
             disk: false,
         })
-        .filter(|s| s.end_ms - s.start_ms >= THROTTLE_MIN_MS)
+        .filter(|s| s.end_ms.saturating_sub(s.start_ms) >= THROTTLE_MIN_MS)
         .collect()
 }
 
@@ -447,5 +451,84 @@ mod tests {
     fn spans_serialize_for_the_ui() {
         let v = serde_json::to_value(TempState::Ok { celsius: 50.0 }).unwrap();
         assert_eq!(v, serde_json::json!({"state": "ok", "celsius": 50.0}));
+    }
+
+    #[test]
+    fn unavailable_and_span_serialize_for_the_ui() {
+        let v = serde_json::to_value(TempState::Unavailable {
+            code: "stuck".into(),
+            detail: "55.0".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"state": "unavailable", "code": "stuck", "detail": "55.0"})
+        );
+        let s = find_stutters(&series("..ccc.."));
+        let v = serde_json::to_value(&s[0]).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"start_ms": 2000, "end_ms": 5000, "first": 2, "last": 4, "cpu": true, "disk": false})
+        );
+    }
+
+    #[test]
+    fn clock_going_backwards_breaks_the_run_without_panic() {
+        let mut p = series("cccccc");
+        // Đồng hồ lùi 3 giây giữa chuỗi: không được coi là liền mạch.
+        for x in &mut p[3..] {
+            x.t_ms -= 3_000;
+        }
+        let s = find_stutters(&p);
+        assert_eq!(s.len(), 2, "{s:?}");
+        assert_eq!((s[0].last, s[1].first), (2, 3));
+        let mut q = series("ccc.");
+        q[1].t_ms = 500;
+        assert!(find_stutters(&q).is_empty(), "mẫu lùi giờ làm đứt đoạn");
+        // 12 mẫu, lùi 5 giây ở mẫu thứ 7 ⇒ hai đoạn 6 giây, không đoạn nào đủ 10 giây.
+        let mut t = throttle_series(12, 95.0, Some(50.0));
+        for x in &mut t[6..] {
+            x.t_ms -= 5_000;
+        }
+        assert!(find_throttle(&t).is_empty());
+        assert_eq!(throttled_now(&t), Some(false));
+    }
+
+    #[test]
+    fn temperature_boundary_and_stuck_clock_restarts_after_error() {
+        let mut t = TempTracker::default();
+        assert_eq!(t.push(0, Ok(20.0)), TempState::Ok { celsius: 20.0 });
+        let mut t = TempTracker::default();
+        t.push(0, Ok(55.0));
+        t.push(30_000, Err("x".into()));
+        assert_eq!(t.push(31_000, Ok(55.0)), TempState::Ok { celsius: 55.0 });
+        assert_eq!(t.push(90_000, Ok(55.0)), TempState::Ok { celsius: 55.0 });
+        assert!(
+            matches!(t.push(91_000, Ok(55.0)), TempState::Unavailable { ref code, .. } if code == "stuck")
+        );
+    }
+
+    #[test]
+    fn throttle_at_two_second_sampling() {
+        let p = |n: u64| -> Vec<Point> {
+            (0..n)
+                .map(|i| Point {
+                    t_ms: (i + 1) * 2000,
+                    dur_ms: 2000,
+                    cpu: 95.0,
+                    disk: 0.0,
+                    perf: Some(50.0),
+                })
+                .collect()
+        };
+        assert_eq!(find_throttle(&p(5)).len(), 1);
+        assert!(find_throttle(&p(4)).is_empty());
+    }
+
+    #[test]
+    fn missing_perf_in_the_middle_breaks_throttle() {
+        let mut p = throttle_series(12, 95.0, Some(50.0));
+        p[5].perf = None;
+        assert!(find_throttle(&p).is_empty());
     }
 }
