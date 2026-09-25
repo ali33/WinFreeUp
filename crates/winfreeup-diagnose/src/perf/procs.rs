@@ -11,7 +11,7 @@ use windows_sys::Win32::System::Threading::{
 };
 use winfreeup_core::{CoreError, Result};
 
-use super::apps::EssentialRules;
+use super::apps::{EssentialRules, ProcTree};
 
 const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004_u32 as i32;
 
@@ -99,13 +99,21 @@ pub fn snapshot() -> Result<Vec<ProcInfo>> {
         }
         break;
     }
+    parse_records(&buf)
+}
+
+/// Đọc chuỗi bản ghi SYSTEM_PROCESS_INFORMATION trong `buf`, bỏ Idle (pid 0). Bản ghi nào nằm vắt ra ngoài
+/// bộ đệm (hoặc lệch căn) ⇒ lỗi, không cắt im lặng rồi trả thiếu tiến trình.
+fn parse_records(buf: &[u64]) -> Result<Vec<ProcInfo>> {
     let base = buf.as_ptr() as *const u8;
     let end = buf.len() * 8;
     let mut out = Vec::with_capacity(512);
     let mut off = 0usize;
-    while off + std::mem::size_of::<SpiEntry>() <= end {
-        // SAFETY: hệ điều hành ghi chuỗi bản ghi nối nhau bằng next_entry_offset trong `buf`; đã kiểm bản ghi
-        // nằm trọn trong buf, và off là bội của 8 (các offset do hệ điều hành căn sẵn).
+    loop {
+        if !off.is_multiple_of(8) || off.checked_add(std::mem::size_of::<SpiEntry>()).is_none_or(|e| e > end) {
+            return Err(CoreError::System(format!("SystemProcessInformation: record at {off} runs past {end} bytes")));
+        }
+        // SAFETY: bản ghi nằm trọn trong buf và căn 8 byte (đã kiểm ở trên); mọi mẫu bit đều hợp lệ cho SpiEntry.
         let e = unsafe { &*(base.add(off) as *const SpiEntry) };
         let pid = e.unique_process_id as u32;
         if pid != 0 {
@@ -124,16 +132,15 @@ pub fn snapshot() -> Result<Vec<ProcInfo>> {
                 name: if pid == 4 && name.is_empty() { "System".into() } else { name },
                 create_time: e.create_time,
                 private_ws: e.working_set_private_size.max(0) as u64,
-                cpu_100ns: (e.user_time + e.kernel_time).max(0) as u64,
-                io_bytes: (e.read_transfer_count + e.write_transfer_count).max(0) as u64,
+                cpu_100ns: e.user_time.saturating_add(e.kernel_time).max(0) as u64,
+                io_bytes: e.read_transfer_count.saturating_add(e.write_transfer_count).max(0) as u64,
             });
         }
         if e.next_entry_offset == 0 {
-            break;
+            return Ok(out);
         }
         off += e.next_entry_offset as usize;
     }
-    Ok(out)
 }
 
 struct Handle(HANDLE);
@@ -196,7 +203,7 @@ pub fn kill(pid: u32, create_time: i64) -> Result<()> {
     kill_with(pid, create_time, &EssentialRules::new(&system32, std::process::id()))
 }
 
-/// Như [`kill`] với luật thiết yếu tùy chọn. Mọi bước kiểm và lệnh kết thúc dùng CÙNG MỘT handle: khi
+/// Như [`kill`] với luật thiết yếu tùy chọn (gồm mọi con cháu của WinFreeUp, lấy từ ảnh chụp mới). Mọi bước kiểm và lệnh kết thúc dùng CÙNG MỘT handle: khi
 /// handle còn mở, hệ điều hành không cấp lại pid đó, nên giờ tạo, đường dẫn và tên đọc được đều là của
 /// đúng tiến trình sắp bị kết thúc. Luật thiết yếu được kiểm lại tại đây (không tin bảng app đã cũ).
 /// Lỗi `essential` là mã, không phải chữ hiển thị.
@@ -207,12 +214,14 @@ pub fn kill_with(pid: u32, create_time: i64, rules: &EssentialRules) -> Result<(
         return Err(CoreError::System(format!("process {pid} has already exited")));
     }
     // Handle đang giữ ⇒ bản ghi cùng (pid, giờ tạo) trong ảnh chụp chính là tiến trình này.
-    let info = snapshot()?
-        .into_iter()
+    let all = snapshot()?;
+    let info = all
+        .iter()
         .find(|p| p.pid == pid && p.create_time == create_time)
         .ok_or_else(|| CoreError::System(format!("process {pid} has already exited")))?;
+    let tree: ProcTree = all.iter().map(|p| (p.pid, (p.parent_pid, p.create_time))).collect();
     let path = image_path(&h);
-    if rules.is_essential(pid, info.parent_pid, &info.name, path.as_deref()) {
+    if rules.is_essential_in(pid, info.parent_pid, create_time, &info.name, path.as_deref(), &tree) {
         return Err(CoreError::System("essential".into()));
     }
     // SAFETY: h là handle có quyền PROCESS_TERMINATE, còn mở.
@@ -271,25 +280,49 @@ mod tests {
         assert!(after >= before + 2_000_000, "{before} -> {after}");
     }
 
+    /// Test hỏng giữa chừng vẫn dọn tiến trình con do chính nó tạo.
+    struct KillOnDrop(std::process::Child);
+
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn records_running_past_the_buffer_are_an_error() {
+        let rec = std::mem::size_of::<SpiEntry>();
+        let mut buf = vec![0u64; rec / 8 + 4];
+        // Bản ghi 1 hợp lệ, trỏ sang bản ghi 2 nằm vắt ra ngoài bộ đệm.
+        buf[0] = 64; // next_entry_offset = 64, number_of_threads = 0
+        assert!(parse_records(&buf).is_err());
+        buf[0] = 0;
+        assert!(parse_records(&buf).unwrap().is_empty(), "pid 0 (Idle) bị bỏ");
+        assert!(parse_records(&buf[..rec / 8 - 1]).is_err(), "bộ đệm nhỏ hơn một bản ghi");
+    }
+
     #[test]
     fn kill_ends_our_own_child_and_refuses_a_stale_create_time() {
-        let mut child = std::process::Command::new("ping")
-            .args(["-n", "60", "127.0.0.1"])
-            .creation_flags(0x0800_0000)
-            .stdout(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
-        let pid = child.id();
+        let mut child = KillOnDrop(
+            std::process::Command::new("ping")
+                .args(["-n", "60", "127.0.0.1"])
+                .creation_flags(0x0800_0000)
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let pid = child.0.id();
         let info = snapshot().unwrap().into_iter().find(|p| p.pid == pid).unwrap();
         assert!(kill(pid, info.create_time + 1).is_err(), "giờ tạo khác ⇒ không phải tiến trình đã thấy");
         // Luật mặc định coi tiến trình con của chính mình (như WebView2 của WinFreeUp) là thiết yếu.
         let refused = kill(pid, info.create_time).unwrap_err();
         assert_eq!(refused.to_string(), "essential");
-        assert!(child.try_wait().unwrap().is_none(), "bị từ chối thì tiến trình phải còn sống");
+        assert!(child.0.try_wait().unwrap().is_none(), "bị từ chối thì tiến trình phải còn sống");
         // Luật không coi test là "chính WinFreeUp" ⇒ kết thúc được tiến trình con do test tạo.
         let rules = EssentialRules::new(&crate::util::system_dir().unwrap(), u32::MAX);
         kill_with(pid, info.create_time, &rules).unwrap();
-        let status = child.wait().unwrap();
+        let status = child.0.wait().unwrap();
         assert!(!status.success());
     }
 

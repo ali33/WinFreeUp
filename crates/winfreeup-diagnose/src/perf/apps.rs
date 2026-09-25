@@ -23,9 +23,11 @@ impl EssentialRules {
     /// **và** exe nằm ngay trong System32 (hoặc không đọc được đường dẫn — chặn cho chắc).
     /// Exe trùng tên đặt ở chỗ khác (vd `C:\Temp\svchost.exe`) thì vẫn cho kết thúc.
     pub fn is_essential(&self, pid: u32, parent_pid: u32, name: &str, path: Option<&str>) -> bool {
-        if pid == self.self_pid || parent_pid == self.self_pid || pid == 4 || pid == 0 {
-            return true;
-        }
+        pid == self.self_pid || parent_pid == self.self_pid || pid == 4 || pid == 0 || self.system_by_name(name, path)
+    }
+
+    /// Tên nằm trong danh sách **và** exe nằm ngay trong System32 (không đọc được đường dẫn ⇒ coi là có).
+    fn system_by_name(&self, name: &str, path: Option<&str>) -> bool {
         let lower = name.to_lowercase();
         let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
         if !ESSENTIAL_NAMES.contains(&stem) {
@@ -39,7 +41,41 @@ impl EssentialRules {
             }
         }
     }
+
+    /// Luật dùng khi có cả ảnh chụp tiến trình (bảng app, lúc kết thúc): như [`is_essential`](Self::is_essential)
+    /// nhưng quan hệ cha–con lấy từ `tree` và kiểm giờ tạo, và phủ **mọi** con cháu của WinFreeUp (WebView2
+    /// sinh tiến trình cháu: renderer, GPU…), không chỉ con trực tiếp.
+    pub fn is_essential_in(&self, pid: u32, parent_pid: u32, create_time: i64, name: &str, path: Option<&str>, tree: &ProcTree) -> bool {
+        pid == self.self_pid
+            || pid == 4
+            || pid == 0
+            || self.system_by_name(name, path)
+            || self.descends_from_self(parent_pid, create_time, tree)
+    }
+
+    /// Đi ngược theo pid cha. Pid được tái dùng nên mỗi bước chỉ nhận cha khi cha được tạo TRƯỚC con;
+    /// không thì chuỗi đứt (cha thật đã chết). Gặp `self_pid` ⇒ là con cháu của WinFreeUp.
+    fn descends_from_self(&self, mut parent: u32, mut child_time: i64, tree: &ProcTree) -> bool {
+        for _ in 0..=tree.len() {
+            let Some(&(grand, parent_time)) = tree.get(&parent) else { return false };
+            if parent_time >= child_time {
+                return false;
+            }
+            if parent == self.self_pid {
+                return true;
+            }
+            if parent == 0 || parent == 4 {
+                return false;
+            }
+            parent = grand;
+            child_time = parent_time;
+        }
+        false
+    }
 }
+
+/// pid ⇒ (pid cha, giờ tạo) của mọi tiến trình trong một ảnh chụp.
+pub type ProcTree = HashMap<u32, (u32, i64)>;
 
 /// Một tiến trình trong mẫu hiện tại, đã kèm đường dẫn và tên thân thiện.
 #[derive(Debug, Clone, PartialEq)]
@@ -114,6 +150,7 @@ pub fn aggregate(prev: &PrevTotals, cur: &[ProcSample], dt_ms: u64, cpus: u32, r
     let cpu_capacity = dt_ms.max(1) as f64 * 10_000.0 * f64::from(cpus.max(1));
     let mut next = PrevTotals::with_capacity(cur.len());
     let mut apps: HashMap<String, AppRow> = HashMap::new();
+    let tree: ProcTree = cur.iter().map(|p| (p.pid, (p.parent_pid, p.create_time))).collect();
     for p in cur {
         next.insert((p.pid, p.create_time), (p.cpu_100ns, p.io_bytes));
         let (cpu, disk_bps) = match prev.get(&(p.pid, p.create_time)) {
@@ -127,7 +164,7 @@ pub fn aggregate(prev: &PrevTotals, cur: &[ProcSample], dt_ms: u64, cpus: u32, r
             Some((u, d)) => (Some(u as f64 / dt_s), Some(d as f64 / dt_s)),
             None => (None, None),
         };
-        let essential = rules.is_essential(p.pid, p.parent_pid, &p.name, p.path.as_deref());
+        let essential = rules.is_essential_in(p.pid, p.parent_pid, p.create_time, &p.name, p.path.as_deref(), &tree);
         let key = app_key(&p.name, p.path.as_deref());
         let row = apps.entry(key.clone()).or_insert_with(|| AppRow {
             key,
@@ -264,6 +301,45 @@ mod tests {
         let (rows, _) = aggregate(&PrevTotals::new(), &[p1, p2], 2000, 1, &rules());
         assert_eq!(rows[0].net_up_bps, Some(500.0));
         assert_eq!(rows[0].net_down_bps, Some(3000.0));
+    }
+
+    fn tree(entries: &[(u32, u32, i64)]) -> ProcTree {
+        entries.iter().map(|&(pid, parent, ct)| (pid, (parent, ct))).collect()
+    }
+
+    #[test]
+    fn every_descendant_of_winfreeup_is_protected() {
+        let r = rules();
+        // WinFreeUp 999 → msedgewebview2 1000 → renderer 1001 → 1002.
+        let t = tree(&[(999, 1, 5), (1000, 999, 10), (1001, 1000, 20), (1002, 1001, 30)]);
+        assert!(r.is_essential_in(1001, 1000, 20, "msedgewebview2.exe", Some(r"C:\x\msedgewebview2.exe"), &t), "cháu");
+        assert!(r.is_essential_in(1002, 1001, 30, "a.exe", Some(r"C:\a.exe"), &t), "chắt");
+        assert!(!r.is_essential_in(1500, 1, 30, "a.exe", Some(r"C:\a.exe"), &t), "không liên quan");
+    }
+
+    #[test]
+    fn a_reused_parent_pid_does_not_make_a_process_a_descendant() {
+        let r = rules();
+        // Cha thật của 2000 đã chết; pid 1500 được cấp lại cho một tiến trình con của WinFreeUp tạo SAU 2000.
+        let t = tree(&[(999, 1, 5), (1500, 999, 30), (2000, 1500, 10)]);
+        assert!(!r.is_essential_in(2000, 1500, 10, "a.exe", Some(r"C:\a.exe"), &t));
+        // Tương tự khi pid của chính WinFreeUp là pid tái dùng của cha cũ (con có trước WinFreeUp).
+        let t = tree(&[(999, 1, 50), (3000, 999, 10)]);
+        assert!(!r.is_essential_in(3000, 999, 10, "a.exe", Some(r"C:\a.exe"), &t));
+    }
+
+    #[test]
+    fn aggregate_locks_grandchildren_of_winfreeup() {
+        let mut me = sample(999, "WinFreeUp.exe", Some(r"D:\WinFreeUp.exe"), 1, 0, 0);
+        me.create_time = 5;
+        let mut wv = sample(1000, "msedgewebview2.exe", Some(r"C:\wv\msedgewebview2.exe"), 1, 0, 0);
+        wv.parent_pid = 999;
+        let mut renderer = sample(1001, "msedgewebview2.exe", Some(r"C:\wv\msedgewebview2.exe"), 1, 0, 0);
+        renderer.parent_pid = 1000;
+        renderer.create_time = 20;
+        let (rows, _) = aggregate(&PrevTotals::new(), &[me, wv, renderer], 1000, 1, &rules());
+        let wv_row = rows.iter().find(|r| r.key.ends_with("msedgewebview2.exe")).unwrap();
+        assert!(wv_row.procs.iter().all(|p| p.essential));
     }
 
     #[test]

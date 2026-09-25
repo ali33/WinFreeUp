@@ -1,19 +1,77 @@
 //! Tên thân thiện (`FileDescription`) và biểu tượng của một exe cho bảng ứng dụng.
-use std::path::Path;
+//!
+//! Chỉ đọc exe trên ổ CỤC BỘ: đường dẫn lấy từ tiến trình đang chạy, mà tiến trình có thể chạy từ ổ mạng
+//! (UNC, WebDAV). Mở file ở đó từ một tiến trình Admin là gửi thông tin xác thực ra ngoài và có thể treo
+//! cả luồng lấy mẫu. Không cục bộ ⇒ giao diện dùng tên file và biểu tượng mặc định.
+use std::path::{Component, Path, Prefix};
 
-use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 use windows_sys::Win32::Graphics::Gdi::{
     CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits, GetObjectW, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
     DIB_RGB_COLORS, HBITMAP,
 };
-use windows_sys::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
-use windows_sys::Win32::UI::Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON};
-use windows_sys::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, ICONINFO};
+use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
+use windows_sys::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, PrivateExtractIconsW, HICON, ICONINFO};
 
 use crate::util::{from_wide, wide};
 
-/// `FileDescription` trong tài nguyên phiên bản của exe (vd «Google Chrome»); không có ⇒ chuỗi rỗng.
+/// `GetDriveTypeW`: ổ tháo rời được / ổ cố định (hằng của `Win32_System_WindowsProgramming`, feature chưa bật).
+const DRIVE_REMOVABLE: u32 = 2;
+const DRIVE_FIXED: u32 = 3;
+
+/// Đường dẫn tuyệt đối trên ổ có chữ cái (`C:\…` hoặc `\?\C:\…`) là ổ cố định hoặc tháo rời được.
+/// Từ chối UNC, `\?\UNC\…`, `\.\…`, WebDAV (`\host@80\…`), đường tương đối và ổ mạng đã gán chữ cái.
+/// Chỉ hỏi loại ổ của gốc `X:\`, không mở file nào.
+pub(crate) fn is_local_file(path: &Path) -> bool {
+    let letter = match path.components().next() {
+        Some(Component::Prefix(p)) => match p.kind() {
+            Prefix::Disk(l) | Prefix::VerbatimDisk(l) => l,
+            _ => return false,
+        },
+        _ => return false,
+    };
+    if !path.has_root() || !letter.is_ascii_alphabetic() {
+        return false;
+    }
+    let root = wide(format!("{}:\\", letter as char));
+    // SAFETY: root là chuỗi UTF-16 kết thúc NUL.
+    let kind = unsafe { GetDriveTypeW(root.as_ptr()) };
+    kind == DRIVE_FIXED || kind == DRIVE_REMOVABLE
+}
+
+/// Vị trí (byte) của `ptr` trong `data`; `None` khi con trỏ nằm ngoài bộ đệm.
+fn field_offset(data: &[u8], ptr: *const u8) -> Option<usize> {
+    let off = (ptr as usize).checked_sub(data.as_ptr() as usize)?;
+    (off < data.len()).then_some(off)
+}
+
+/// Lát `data[offset .. offset + len]`, kẹp đuôi vào biên bộ đệm; `offset` ngoài bộ đệm ⇒ `None`.
+fn clamp_field(data: &[u8], offset: usize, len: usize) -> Option<&[u8]> {
+    if offset >= data.len() {
+        return None;
+    }
+    Some(&data[offset..offset.saturating_add(len).min(data.len())])
+}
+
+fn le_u16s(bytes: &[u8]) -> Vec<u16> {
+    bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()
+}
+
+/// Bảng `\VarFileInfo\Translation`: các cặp (ngôn ngữ, bảng mã) u16 ⇒ `"040904b0"`.
+fn translations(bytes: &[u8]) -> Vec<String> {
+    le_u16s(bytes).chunks_exact(2).map(|c| format!("{:04x}{:04x}", c[0], c[1])).collect()
+}
+
+/// Chuỗi UTF-16 LE tới NUL đầu tiên (hoặc hết lát).
+fn utf16_text(bytes: &[u8]) -> String {
+    from_wide(&le_u16s(bytes))
+}
+
+/// `FileDescription` trong tài nguyên phiên bản của exe (vd «Google Chrome»); không có hoặc không phải
+/// file cục bộ ⇒ chuỗi rỗng.
 pub fn file_description(path: &Path) -> String {
+    if !is_local_file(path) {
+        return String::new();
+    }
     let w = wide(path);
     // SAFETY: w là chuỗi UTF-16 kết thúc NUL; tham số handle được phép null.
     let size = unsafe { GetFileVersionInfoSizeW(w.as_ptr(), std::ptr::null_mut()) };
@@ -25,26 +83,25 @@ pub fn file_description(path: &Path) -> String {
     if unsafe { GetFileVersionInfoW(w.as_ptr(), 0, size, data.as_mut_ptr().cast()) } == 0 {
         return String::new();
     }
-    let query = |sub: &str| -> Option<(*const u8, u32)> {
+    // Trả lát đã kẹp trong `data`: không tin độ dài/con trỏ VerQueryValueW trả về (file có thể cố tình hỏng).
+    let query = |sub: &str, len_unit: usize| -> Option<&[u8]> {
         let q = wide(sub);
         let mut ptr: *mut core::ffi::c_void = std::ptr::null_mut();
         let mut len = 0u32;
-        // SAFETY: data là khối phiên bản do GetFileVersionInfoW ghi; ptr trả về trỏ vào bên trong data.
+        // SAFETY: data là khối phiên bản do GetFileVersionInfoW ghi; q kết thúc NUL; ptr/len là biến cục bộ.
         let ok = unsafe { VerQueryValueW(data.as_ptr().cast(), q.as_ptr(), &mut ptr, &mut len) };
-        (ok != 0 && !ptr.is_null() && len > 0).then_some((ptr as *const u8, len))
+        if ok == 0 || ptr.is_null() || len == 0 {
+            return None;
+        }
+        clamp_field(&data, field_offset(&data, ptr as *const u8)?, (len as usize).saturating_mul(len_unit))
     };
-    let mut langs = Vec::new();
-    if let Some((p, len)) = query(r"\VarFileInfo\Translation") {
-        // SAFETY: bảng dịch là các cặp u16 dài `len` byte, nằm trong data.
-        let pairs = unsafe { std::slice::from_raw_parts(p as *const u16, len as usize / 2) };
-        langs.extend(pairs.chunks_exact(2).map(|c| format!("{:04x}{:04x}", c[0], c[1])));
-    }
+    // Translation: `len` tính bằng byte. Chuỗi: `len` tính bằng ký tự UTF-16.
+    let mut langs = query(r"\VarFileInfo\Translation", 1).map(translations).unwrap_or_default();
     // Nhiều exe khai sai bảng dịch: thử thêm tiếng Anh Mỹ với hai bảng mã hay gặp.
     langs.extend(["040904b0".to_string(), "040904e4".to_string()]);
     for l in langs {
-        if let Some((p, len)) = query(&format!(r"\StringFileInfo\{l}\FileDescription")) {
-            // SAFETY: giá trị chuỗi dài `len` ký tự UTF-16 (gồm NUL), nằm trong data.
-            let s = from_wide(unsafe { std::slice::from_raw_parts(p as *const u16, len as usize) });
+        if let Some(bytes) = query(&format!(r"\StringFileInfo\{l}\FileDescription"), 2) {
+            let s = utf16_text(bytes);
             if !s.trim().is_empty() {
                 return s.trim().to_string();
             }
@@ -128,48 +185,45 @@ unsafe fn read_bitmap(hbm: HBITMAP) -> Option<(u32, u32, Vec<u8>)> {
     (lines == h).then_some((w as u32, h as u32, px))
 }
 
-/// Biểu tượng 32×32 của exe dạng `data:image/png;base64,…`; không lấy được ⇒ `None` (giao diện hiện ô trống).
+/// Biểu tượng 32×32 của exe dạng `data:image/png;base64,…`; không lấy được, không phải `.exe` hoặc không
+/// phải file cục bộ ⇒ `None` (giao diện hiện biểu tượng mặc định).
+///
+/// Dùng `PrivateExtractIconsW` (đọc thẳng tài nguyên icon của exe) thay `SHGetFileInfoW`: không nạp phần
+/// mở rộng Shell của bên thứ ba vào tiến trình Admin, không cần COM.
 pub fn icon_data_url(path: &Path) -> Option<String> {
-    // SHGetFileInfo không nhận dấu `/`.
-    let path = std::path::PathBuf::from(path.to_string_lossy().replace('/', "\\"));
-    // Luồng riêng: SHGetFileInfo cần COM STA trên luồng gọi, không đụng chế độ COM của luồng người gọi.
-    std::thread::spawn(move || unsafe {
-        let com = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
-        let result = (|| {
-            let w = wide(&path);
-            let mut sfi: SHFILEINFOW = std::mem::zeroed();
-            let r = SHGetFileInfoW(w.as_ptr(), 0, &mut sfi, std::mem::size_of::<SHFILEINFOW>() as u32, SHGFI_ICON | SHGFI_LARGEICON);
-            if r == 0 || sfi.hIcon.is_null() {
-                return None;
-            }
-            let mut ii: ICONINFO = std::mem::zeroed();
-            let ok = GetIconInfo(sfi.hIcon, &mut ii);
-            DestroyIcon(sfi.hIcon);
-            if ok == 0 {
-                return None;
-            }
-            let color = read_bitmap(ii.hbmColor);
-            let mask = read_bitmap(ii.hbmMask);
-            if !ii.hbmColor.is_null() {
-                DeleteObject(ii.hbmColor);
-            }
-            if !ii.hbmMask.is_null() {
-                DeleteObject(ii.hbmMask);
-            }
-            let (w, h, px) = color?;
-            // Mặt nạ AND: điểm đen (0) là phần hình, trắng là nền trong suốt.
-            let opaque: Option<Vec<bool>> = mask.map(|(_, _, m)| m.chunks_exact(4).map(|p| p[0] == 0).collect());
-            let png = bgra_to_png(w, h, &px, opaque.as_deref())?;
-            Some(format!("data:image/png;base64,{}", base64(&png)))
-        })();
-        if com {
-            CoUninitialize();
+    if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")) || !is_local_file(path) {
+        return None;
+    }
+    let w = wide(path);
+    let mut icon: HICON = std::ptr::null_mut();
+    let mut id = 0u32;
+    // SAFETY: w kết thúc NUL; xin đúng 1 icon vào `icon`/`id` là biến cục bộ.
+    let n = unsafe { PrivateExtractIconsW(w.as_ptr(), 0, 32, 32, &mut icon, &mut id, 1, 0) };
+    if n == 0 || n == u32::MAX || icon.is_null() {
+        return None;
+    }
+    // SAFETY: icon là HICON hợp lệ do API vừa tạo, hủy đúng một lần; hai bitmap của ICONINFO thuộc về ta.
+    unsafe {
+        let mut ii: ICONINFO = std::mem::zeroed();
+        let ok = GetIconInfo(icon, &mut ii);
+        DestroyIcon(icon);
+        if ok == 0 {
+            return None;
         }
-        result
-    })
-    .join()
-    .ok()
-    .flatten()
+        let color = read_bitmap(ii.hbmColor);
+        let mask = read_bitmap(ii.hbmMask);
+        if !ii.hbmColor.is_null() {
+            DeleteObject(ii.hbmColor);
+        }
+        if !ii.hbmMask.is_null() {
+            DeleteObject(ii.hbmMask);
+        }
+        let (w, h, px) = color?;
+        // Mặt nạ AND: điểm đen (0) là phần hình, trắng là nền trong suốt.
+        let opaque: Option<Vec<bool>> = mask.map(|(_, _, m)| m.chunks_exact(4).map(|p| p[0] == 0).collect());
+        let png = bgra_to_png(w, h, &px, opaque.as_deref())?;
+        Some(format!("data:image/png;base64,{}", base64(&png)))
+    }
 }
 
 #[cfg(test)]
@@ -205,6 +259,59 @@ mod tests {
         assert!(!file_description(&notepad()).is_empty());
         let url = icon_data_url(&notepad()).unwrap();
         assert!(url.starts_with("data:image/png;base64,iVBORw0KGgo"));
+    }
+
+    #[test]
+    fn only_local_drive_paths_are_read() {
+        assert!(is_local_file(&notepad()));
+        for p in [
+            r"\\127.0.0.1\c$\Windows\notepad.exe",
+            r"\\?\UNC\127.0.0.1\c$\Windows\notepad.exe",
+            r"\\.\C:\Windows\notepad.exe",
+            r"\\host@80\share\x.exe",
+            r"Windows\notepad.exe",
+        ] {
+            assert!(!is_local_file(Path::new(p)), "{p}");
+        }
+        let verbatim = format!(r"\\?\{}", notepad().display());
+        assert!(is_local_file(Path::new(&verbatim)));
+    }
+
+    #[test]
+    fn network_paths_give_nothing_without_touching_the_network() {
+        let unc = Path::new(r"\\127.0.0.1\c$\Windows\notepad.exe");
+        let t = std::time::Instant::now();
+        assert_eq!(file_description(unc), "");
+        assert_eq!(icon_data_url(unc), None);
+        assert!(t.elapsed() < std::time::Duration::from_millis(500), "không được đi ra mạng");
+    }
+
+    #[test]
+    fn icons_only_for_exe_files() {
+        let ini = crate::util::windows_dir().unwrap().join("win.ini");
+        assert_eq!(icon_data_url(&ini), None);
+    }
+
+    #[test]
+    fn version_fields_are_clamped_to_the_buffer() {
+        let data = [1u8, 2, 3, 4, 5, 6];
+        assert_eq!(clamp_field(&data, 2, 2), Some(&data[2..4]));
+        assert_eq!(clamp_field(&data, 4, 100), Some(&data[4..6]), "độ dài vượt biên bị kẹp");
+        assert_eq!(clamp_field(&data, 6, 1), None, "offset ở ngoài bộ đệm");
+        assert_eq!(clamp_field(&data, usize::MAX, 2), None);
+        assert_eq!(field_offset(&data, data.as_ptr().wrapping_add(3)), Some(3));
+        assert_eq!(field_offset(&data, data.as_ptr().wrapping_add(6)), None);
+        assert_eq!(field_offset(&data, data.as_ptr().wrapping_sub(1)), None);
+    }
+
+    #[test]
+    fn translation_and_text_parse_from_bytes() {
+        // Cặp (0x0409, 0x04B0) + nửa cặp lẻ bị bỏ.
+        assert_eq!(translations(&[0x09, 0x04, 0xB0, 0x04, 0x07]), vec!["040904b0".to_string()]);
+        let mut text: Vec<u8> = "Notepad".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        text.extend_from_slice(&[0, 0, b'x', 0]);
+        assert_eq!(utf16_text(&text), "Notepad");
+        assert_eq!(utf16_text(&[b'A', 0, b'B']), "A", "byte lẻ cuối bị bỏ");
     }
 
     #[test]
