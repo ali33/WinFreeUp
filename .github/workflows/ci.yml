@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "feat/**"]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: npm ci
+      - name: Vitest
+        run: npm test
+      - name: cargo test (lõi)
+        run: cargo test -p winfreeup-core
+      - name: clippy (lõi)
+        run: cargo clippy -p winfreeup-core --all-targets -- -D warnings
+      - name: tauri build (một file exe)
+        run: npx tauri build --no-bundle
+      - name: Kiểm manifest Admin
+        shell: cmd
+        run: findstr /m requireAdministrator target\release\WinFreeUp.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WinFreeUp-exe
+          path: target/release/WinFreeUp.exe
