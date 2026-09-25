@@ -14,6 +14,8 @@ pub struct FakeOps {
     pub sys: SystemInfo,
     /// Tên thao tác sẽ hỏng, dạng `"<hàm>:<khoá>"`, vd `"reg_write:HKLM\X|V"`, `"remove_package:A_1"`.
     pub fail: HashSet<String>,
+    /// Family (chữ thường) đang provisioned — `deprovision` trả `Ok(true)` và bỏ khỏi đây.
+    pub provisioned: Mutex<HashSet<String>>,
     pub calls: Mutex<Vec<String>>,
 }
 
@@ -26,6 +28,7 @@ impl Default for FakeOps {
             packages: Mutex::default(),
             sys: SystemInfo { build: 26100, edition: "Pro".into(), managed: false, other_user: false },
             fail: HashSet::new(),
+            provisioned: Mutex::default(),
             calls: Mutex::default(),
         }
     }
@@ -56,6 +59,11 @@ impl FakeOps {
             is_framework: false,
             non_removable: false,
         });
+        self
+    }
+    /// Gói có trong ảnh cài đặt (provisioned) ⇒ `deprovision` trả `Ok(true)`.
+    pub fn with_provisioned(self, family: &str) -> Self {
+        self.provisioned.lock().unwrap().insert(family.to_ascii_lowercase());
         self
     }
     pub fn failing(mut self, what: &str) -> Self {
@@ -122,8 +130,9 @@ impl TweakOps for FakeOps {
         self.packages.lock().unwrap().retain(|p| p.full_name != full_name);
         Ok(())
     }
-    fn deprovision(&self, family: &str) -> Result<(), String> {
-        self.call(format!("deprovision:{family}"))
+    fn deprovision(&self, family: &str) -> Result<bool, String> {
+        self.call(format!("deprovision:{family}"))?;
+        Ok(self.provisioned.lock().unwrap().remove(&family.to_ascii_lowercase()))
     }
     fn open_uri(&self, uri: &str) -> Result<(), String> {
         self.call(format!("open_uri:{uri}"))

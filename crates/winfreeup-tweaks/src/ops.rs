@@ -49,6 +49,11 @@ pub fn edition_of(edition_id: &str) -> &'static str {
     }
 }
 
+/// `ops.packages(family)` lọc lại đúng `family` (không phân biệt hoa thường) — dùng ở mọi chỗ đọc gói.
+pub fn packages_of(ops: &dyn TweakOps, family: &str) -> Result<Vec<PackageInfo>, String> {
+    Ok(ops.packages(family)?.into_iter().filter(|p| p.family.eq_ignore_ascii_case(family)).collect())
+}
+
 pub trait TweakOps: Send + Sync {
     /// `path` dạng `HKCU\...` hoặc `HKLM\...`. `Ok(None)` = key hoặc value không tồn tại.
     fn reg_read(&self, path: &str, name: &str) -> Result<Option<RegData>, String>;
@@ -65,9 +70,13 @@ pub trait TweakOps: Send + Sync {
     fn task_enabled(&self, path: &str) -> Result<Option<bool>, String>;
     fn set_task_enabled(&self, path: &str, enabled: bool) -> Result<(), String>;
     /// Các gói của người dùng hiện tại thuộc `family` (thường 0 hoặc 1 gói).
+    /// BẮT BUỘC chỉ trả gói có `family` đúng bằng tham số (so không phân biệt hoa thường) — không lọc
+    /// theo tên hay tiền tố. Phía gọi vẫn lọc lại bằng `packages_of` để phòng thủ.
     fn packages(&self, family: &str) -> Result<Vec<PackageInfo>, String>;
     fn remove_package(&self, full_name: &str, all_users: bool) -> Result<(), String>;
-    fn deprovision(&self, family: &str) -> Result<(), String>;
+    /// Gỡ gói khỏi ảnh cài đặt (người dùng mới không nhận app). `Ok(true)` = thật sự có gói
+    /// provisioned thuộc `family` và đã gỡ; `Ok(false)` = không có gì để gỡ.
+    fn deprovision(&self, family: &str) -> Result<bool, String>;
     fn open_uri(&self, uri: &str) -> Result<(), String>;
     fn system_info(&self) -> Result<SystemInfo, String>;
     fn restart_explorer(&self) -> Result<(), String>;

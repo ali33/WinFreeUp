@@ -7,7 +7,7 @@ use serde::Serialize;
 
 use crate::blocklist::is_blocked_package;
 use crate::model::{default_data, to_reg_data, Group, Level, Op, Restart, Risk, StartType, Tweak};
-use crate::ops::{SystemInfo, TweakOps};
+use crate::ops::{packages_of, SystemInfo, TweakOps};
 use crate::state::{op_state, supported, tweak_status, OpState, TweakStatus};
 use crate::undo::{Snapshot, UndoStore};
 
@@ -59,7 +59,8 @@ pub enum TweakEvent {
     Finished { outcome: TweakOutcome },
 }
 
-/// Một lượt áp dụng/hoàn tác tại một thời điểm (cùng file ảnh chụp, cùng máy).
+/// Một lượt áp dụng/hoàn tác tại một thời điểm (cùng file ảnh chụp, cùng máy). Chỉ trong MỘT tiến
+/// trình — hai tiến trình WinFreeUp vẫn chồng nhau được, vỏ Tauri (Task 12) phải bảo đảm chạy một bản.
 static RUN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Id đưa vào lỗi/nhật ký: id lạ (không có trong danh mục) chỉ được echo nếu đúng dạng id danh mục.
@@ -100,14 +101,16 @@ pub fn read_all(catalog: &[Tweak], ops: &dyn TweakOps, undo_path: &Path) -> Resu
 }
 
 /// Ghi ảnh chụp (nếu chưa có) xuống đĩa. Không lưu được ⇒ `Err` và thao tác KHÔNG được chạy.
-fn snapshot(undo: &mut UndoStore, id: &str, i: usize, snap: Snapshot) -> Result<(), String> {
-    if undo.record_if_absent(id, i, snap) {
-        if let Err(e) = undo.save() {
-            undo.remove(id, i);
-            return Err(format!("undo_save: {e}"));
-        }
+/// `Ok(true)` = vừa ghi mới; `Ok(false)` = đã có từ trước (giữ bản gốc).
+fn snapshot(undo: &mut UndoStore, id: &str, i: usize, snap: Snapshot) -> Result<bool, String> {
+    if !undo.record_if_absent(id, i, snap) {
+        return Ok(false);
     }
-    Ok(())
+    if let Err(e) = undo.save() {
+        undo.remove(id, i);
+        return Err(format!("undo_save: {e}"));
+    }
+    Ok(true)
 }
 
 /// Chạy một thao tác áp dụng. `Ok(true)` = đã thay đổi máy.
@@ -162,17 +165,16 @@ fn apply_op(ops: &dyn TweakOps, undo: &mut UndoStore, id: &str, i: usize, op: &O
             }
             let mut changed = false;
             let mut blocked = false;
-            for p in ops.packages(package_family)? {
-                // Phòng thủ: lớp thật lọc lỏng (vd theo tên) thì không gỡ nhầm gói khác family.
-                if !p.family.eq_ignore_ascii_case(package_family) {
-                    continue;
-                }
+            // Ảnh chụp của thao tác này được ghi mới trong lượt này (không phải bản gốc từ lượt trước).
+            let mut fresh = false;
+            // Phòng thủ: lớp thật lọc lỏng (vd theo tên) thì không gỡ nhầm gói khác family.
+            for p in packages_of(ops, package_family)? {
                 if is_blocked_package(&p.family) || p.is_framework || p.non_removable {
                     blocked = true;
                     errors.push(format!("{id}#{i}: blocked:{}", p.family));
                     continue;
                 }
-                snapshot(undo, id, i, Snapshot::Appx { family: p.family.clone() })?;
+                fresh |= snapshot(undo, id, i, Snapshot::Appx { family: p.family.clone() })?;
                 match ops.remove_package(&p.full_name, all_users) {
                     Ok(()) => changed = true,
                     Err(e) => errors.push(format!("{id}#{i}: {e}")),
@@ -181,10 +183,22 @@ fn apply_op(ops: &dyn TweakOps, undo: &mut UndoStore, id: &str, i: usize, op: &O
             if all_users && !blocked {
                 // Gỡ khỏi ảnh cài đặt cũng cần đường quay lại (nút «Cài lại từ Store»), kể cả khi
                 // tài khoản hiện tại không có gói.
-                snapshot(undo, id, i, Snapshot::Appx { family: package_family.clone() })?;
-                match ops.deprovision(package_family) {
-                    Ok(()) => changed = true,
-                    Err(e) => errors.push(format!("{id}#{i}: {e}")),
+                fresh |= snapshot(undo, id, i, Snapshot::Appx { family: package_family.clone() })?;
+                let deprovisioned = match ops.deprovision(package_family) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        errors.push(format!("{id}#{i}: {e}"));
+                        false
+                    }
+                };
+                changed |= deprovisioned;
+                // Lượt này không gỡ được gì mà ảnh chụp là mới ⇒ bỏ, kẻo mục hiện «Đã gỡ» và hoàn tác
+                // mở Store cho thứ WinFreeUp chưa từng gỡ.
+                if fresh && !changed {
+                    undo.remove(id, i);
+                    if let Err(e) = undo.save() {
+                        errors.push(format!("{id}#{i}: undo_save: {e}"));
+                    }
                 }
             }
             Ok(changed)
@@ -195,7 +209,9 @@ fn apply_op(ops: &dyn TweakOps, undo: &mut UndoStore, id: &str, i: usize, op: &O
 enum Reverted {
     /// Đã ghi lại giá trị cũ ⇒ xoá ảnh chụp của thao tác; máy có đổi.
     Done,
-    /// Máy đã ở giá trị cũ sẵn (người dùng tự trả, app đã cài lại…) ⇒ chỉ xoá ảnh chụp, máy không đổi.
+    /// Không cần ghi gì ⇒ chỉ xoá ảnh chụp, máy không đổi: máy đã ở giá trị cũ sẵn (người dùng tự trả,
+    /// app đã cài lại…), ảnh chụp tác vụ vốn tắt (hoàn tác không bật), hoặc registry_delete mà value vốn
+    /// không có.
     Cleared,
     /// Không làm gì (không có gì để trả).
     Nothing,
@@ -233,7 +249,9 @@ fn revert_op(ops: &dyn TweakOps, snap: Option<&Snapshot>, op: &Op, store_seen: &
                 }
                 ops.reg_write(path, name, d).map(|_| Reverted::Done)
             }
-            Some(_) => Ok(Reverted::Cleared),
+            Some(Snapshot::Registry { data: None }) => Ok(Reverted::Cleared),
+            // Ảnh chụp khác loại (file bị sửa tay, danh mục đổi thứ tự thao tác) ⇒ báo, giữ ảnh chụp.
+            Some(_) => Err("snapshot_mismatch".into()),
             None => Err("no_snapshot".into()),
         },
         Op::ServiceStartup { service, default, .. } => {
@@ -260,7 +278,7 @@ fn revert_op(ops: &dyn TweakOps, snap: Option<&Snapshot>, op: &Op, store_seen: &
             Ok(Reverted::Done)
         }
         Op::AppxRemove { package_family, store_product_id } => {
-            if !ops.packages(package_family)?.is_empty() {
+            if !packages_of(ops, package_family)?.is_empty() {
                 return Ok(Reverted::Cleared);
             }
             if snap.is_none() || store_seen.contains(store_product_id) {
@@ -302,10 +320,13 @@ fn run(catalog: &[Tweak], ops: &dyn TweakOps, undo_path: &Path, ids: &[String], 
             (_, Err(e)) => TweakOutcome { id: id.clone(), status: TweakStatus::NotApplied, errors: vec![format!("{id}: {e}")], store_opened },
             (Some(t), Ok(sys)) => {
                 let (before, _) = tweak_status(t, sys, ops, &undo);
-                // Mục sai build/edition nhưng có ảnh chụp vẫn «actionable» (để hoàn tác được) —
-                // chỉ cho hoàn tác, không cho áp dụng lại.
-                let wrong_system = matches!(mode, Mode::Apply { .. }) && supported(t, sys).is_err();
-                if !before.actionable() || wrong_system {
+                // Mục «không hỗ trợ» (sai build/edition…) mà có ảnh chụp ⇒ chỉ cho hoàn tác, không cho
+                // áp dụng lại.
+                let allowed = match mode {
+                    Mode::Apply { .. } => before.actionable() && supported(t, sys).is_ok(),
+                    Mode::Revert => before.actionable() || (matches!(before, TweakStatus::Unsupported { .. }) && undo.has_any(id)),
+                };
+                if !allowed {
                     errors.push(format!("{id}: not_allowed"));
                 } else {
                     let mut changed = false;
@@ -351,10 +372,14 @@ fn run(catalog: &[Tweak], ops: &dyn TweakOps, undo_path: &Path, ids: &[String], 
     RunReport { outcomes, restart, notices }
 }
 
+/// Áp dụng các mục `ids` (trùng ⇒ chạy một lần). `on_event` KHÔNG được gọi lại `apply`/`revert`
+/// (khoá `RUN_LOCK` không vào lại được ⇒ treo).
 pub fn apply(catalog: &[Tweak], ops: &dyn TweakOps, undo_path: &Path, ids: &[String], all_users: bool, on_event: &dyn Fn(&TweakEvent)) -> RunReport {
     run(catalog, ops, undo_path, ids, Mode::Apply { all_users }, on_event)
 }
 
+/// Hoàn tác các mục `ids` (trùng ⇒ chạy một lần), kể cả mục «không hỗ trợ» còn ảnh chụp. `on_event`
+/// KHÔNG được gọi lại `apply`/`revert` (khoá `RUN_LOCK` không vào lại được ⇒ treo).
 pub fn revert(catalog: &[Tweak], ops: &dyn TweakOps, undo_path: &Path, ids: &[String], on_event: &dyn Fn(&TweakEvent)) -> RunReport {
     run(catalog, ops, undo_path, ids, Mode::Revert, on_event)
 }
@@ -619,7 +644,7 @@ ops = [
     #[test]
     fn all_users_snapshots_then_deprovisions_even_when_current_user_lacks_the_package() {
         let e = env();
-        let f = FakeOps::default().with_package("G.One_1");
+        let f = FakeOps::default().with_package("G.One_1").with_provisioned("G.Two_1").with_provisioned("G.Three_1");
         let r = apply(&e.cat, &f, &e.undo, &ids(&["gamebar"]), true, &quiet);
         assert!(r.outcomes[0].errors.is_empty(), "{:?}", r.outcomes[0].errors);
         assert!(f.calls().contains(&"deprovision:G.Two_1".to_string()));
@@ -670,7 +695,7 @@ ops = [
         fn remove_package(&self, n: &str, a: bool) -> Result<(), String> {
             self.0.remove_package(n, a)
         }
-        fn deprovision(&self, f: &str) -> Result<(), String> {
+        fn deprovision(&self, f: &str) -> Result<bool, String> {
             self.0.deprovision(f)
         }
         fn open_uri(&self, u: &str) -> Result<(), String> {
@@ -682,6 +707,60 @@ ops = [
         fn restart_explorer(&self) -> Result<(), String> {
             self.0.restart_explorer()
         }
+    }
+
+    #[test]
+    fn deprovision_that_removed_nothing_drops_its_fresh_snapshot() {
+        let e = env();
+        // #0: gỡ được G.One ⇒ giữ; #1: deprovision hỏng ⇒ bỏ; #2: deprovision gỡ thật ⇒ giữ.
+        let f = FakeOps::default().with_package("G.One_1").with_provisioned("G.Three_1").failing("deprovision:G.Two_1");
+        let r = apply(&e.cat, &f, &e.undo, &ids(&["gamebar"]), true, &quiet);
+        assert_eq!(r.outcomes[0].errors, vec!["gamebar#1: fake failure: deprovision:G.Two_1".to_string()]);
+        let (u, _) = UndoStore::load(&e.undo);
+        assert_eq!((u.get("gamebar", 0).is_some(), u.get("gamebar", 1).is_some(), u.get("gamebar", 2).is_some()), (true, false, true));
+    }
+
+    #[test]
+    fn snapshot_not_stuck_when_all_users_run_changed_nothing() {
+        for failing_deprovision in [false, true] {
+            let e = env();
+            let mut f = FakeOps::default().with_package("A.App_1").failing("remove_package:A.App_1!1:true");
+            if failing_deprovision {
+                f = f.failing("deprovision:A.App_1");
+            }
+            let r = apply(&e.cat, &f, &e.undo, &ids(&["app"]), true, &quiet);
+            assert_eq!(r.restart, Restart::None);
+            let (u, _) = UndoStore::load(&e.undo);
+            assert!(!u.has_any("app"), "deprovision={failing_deprovision}: không gỡ được gì ⇒ không để lại ảnh chụp");
+            // Người dùng tự gỡ app sau đó ⇒ hoàn tác không được mở Store cho thứ WinFreeUp chưa từng gỡ.
+            f.packages.lock().unwrap().clear();
+            revert(&e.cat, &f, &e.undo, &ids(&["app"]), &quiet);
+            assert!(!f.calls().iter().any(|c| c.starts_with("open_uri:")), "{:?}", f.calls());
+        }
+    }
+
+    #[test]
+    fn read_and_revert_ignore_packages_of_another_family() {
+        let e = env();
+        let f = LoosePackages(FakeOps::default().with_package("A.App_1").with_package("B.Other_1"));
+        apply(&e.cat, &f, &e.undo, &ids(&["app"]), false, &quiet);
+        let read = read_all(&e.cat, &f, &e.undo).unwrap();
+        assert_eq!(read.tweaks.iter().find(|t| t.id == "app").unwrap().status, TweakStatus::Applied, "B.Other không phải gói của mục");
+        let r = revert(&e.cat, &f, &e.undo, &ids(&["app"]), &quiet);
+        assert_eq!(r.outcomes[0].store_opened, vec!["9P1J8S7CCWWT"]);
+    }
+
+    #[test]
+    fn registry_delete_with_foreign_snapshot_kind_is_an_error_and_keeps_it() {
+        let e = env();
+        let (mut u, _) = UndoStore::load(&e.undo);
+        u.record_if_absent("del", 0, Snapshot::Service { start: StartType::Auto });
+        u.save().unwrap();
+        let f = FakeOps::default();
+        let r = revert(&e.cat, &f, &e.undo, &ids(&["del"]), &quiet);
+        assert_eq!(r.outcomes[0].errors, vec!["del#0: snapshot_mismatch".to_string()]);
+        let (u, _) = UndoStore::load(&e.undo);
+        assert!(u.get("del", 0).is_some(), "ảnh chụp lạ ⇒ giữ nguyên để người sửa xem");
     }
 
     #[test]
@@ -817,6 +896,9 @@ ops = [
         assert_eq!(r.outcomes[0].status, TweakStatus::Applied);
         // Máy đổi build/edition (vd hạ cấp) — mục có ảnh chụp nên trạng thái thật vẫn «đã áp dụng».
         f.sys.build = 22631;
+        let read = read_all(&e.cat, &f, &e.undo).unwrap();
+        let v = serde_json::to_value(read.tweaks.iter().find(|t| t.id == "recall").unwrap()).unwrap();
+        assert_eq!((v["status"].as_str(), v["reason"].as_str(), v["has_undo"].as_bool()), (Some("unsupported"), Some("build_min:26100"), Some(true)));
         f.reg_delete(r"HKLM\SOFTWARE\Policies\R", "v").unwrap();
         let before = f.calls().len();
         let r = apply(&e.cat, &f, &e.undo, &ids(&["recall"]), false, &quiet);
