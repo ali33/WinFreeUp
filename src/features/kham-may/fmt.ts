@@ -74,9 +74,36 @@ export function friendly(e: unknown): string {
       return tk('km.err.aborted');
     case 'unknown_volume':
       return tk('km.err.unknownVolume');
+    case 'bad_path':
+      return tk('km.err.badPath');
+    case 'redirected_path':
+      return tk('km.err.redirectedPath');
+    case 'no_recycle_bin':
+      return tk('km.err.noRecycleBin');
+    case 'recycle_disabled':
+      return tk('km.err.recycleDisabled');
+    case 'onedrive':
+      return tk('km.err.onedrive');
     default:
-      return m;
+      return protectReason(m) ?? m;
   }
+}
+
+const PROTECT_REASONS = [
+  'system_dir',
+  'user_profile_root',
+  'drive_root',
+  'root_special',
+  'link_ancestor',
+  'bad_path',
+  'canonical_protected',
+] as const;
+
+/** `protected:<lý do>` (lõi, `ProtectRules::protect_reason`) ⇒ câu nói vì sao mục bị khoá; lý do lạ ⇒ câu chung. */
+function protectReason(m: string): string | undefined {
+  if (!m.startsWith('protected:')) return undefined;
+  const reason = m.slice('protected:'.length);
+  return (PROTECT_REASONS as readonly string[]).includes(reason) ? tk(`km.protect.${reason}`) : tk('km.err.protected');
 }
 
 /** JSON khi được; `undefined`, vòng tham chiếu, BigInt… thì `String(e)` — không bao giờ ném. */

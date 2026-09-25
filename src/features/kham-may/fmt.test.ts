@@ -26,6 +26,19 @@ describe('định dạng', () => {
     expect(friendly('unknown_node')).toContain('quét lại');
     expect(friendly(new Error('Access is denied. (os error 5)'))).toBe('Access is denied. (os error 5)');
     expect(friendly('unknown_volume')).toContain('bị rút ra');
+    expect(friendly('bad_path')).toContain('không hợp lệ');
+    expect(friendly('redirected_path')).toContain('liên kết');
+    expect(friendly('no_recycle_bin')).toContain('không có Thùng rác');
+    expect(friendly('recycle_disabled')).toContain('bị tắt');
+    expect(friendly('onedrive')).toContain('OneDrive');
+    expect(friendly('protected:system_dir')).toContain('thư mục của Windows');
+    expect(friendly('protected:user_profile_root')).toContain('thư mục người dùng');
+    expect(friendly('protected:drive_root')).toContain('gốc ổ đĩa');
+    expect(friendly('protected:root_special')).toContain('mục hệ thống ở gốc ổ');
+    expect(friendly('protected:link_ancestor')).toContain('liên kết');
+    expect(friendly('protected:bad_path')).toContain('dạng lạ');
+    expect(friendly('protected:canonical_protected')).toContain('Đường thật');
+    expect(friendly('protected:la')).toBe(friendly('protected'));
   });
 
   it('lỗi không phải chuỗi/Error vẫn ra chữ, không ném', () => {
