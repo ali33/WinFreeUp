@@ -2,7 +2,7 @@
 use serde::Serialize;
 
 use crate::model::{to_reg_data, Group, Op, Tweak};
-use crate::ops::{SystemInfo, TweakOps};
+use crate::ops::{packages_of, SystemInfo, TweakOps};
 use crate::undo::UndoStore;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -78,7 +78,7 @@ pub fn op_state(ops: &dyn TweakOps, op: &Op, had_snapshot: bool) -> Result<OpSta
             Some(true) => OpState::Differ,
         },
         Op::AppxRemove { package_family, .. } => {
-            if !ops.packages(package_family)?.is_empty() {
+            if !packages_of(ops, package_family)?.is_empty() {
                 OpState::Differ
             } else if had_snapshot {
                 OpState::Match
@@ -96,9 +96,9 @@ fn is_policy_path(path: &str) -> bool {
 /// Trạng thái cả mục và các lỗi đọc (nguyên văn). Lỗi đọc một thao tác ⇒ tính là `Differ`.
 pub fn tweak_status(t: &Tweak, sys: &SystemInfo, ops: &dyn TweakOps, undo: &UndoStore) -> (TweakStatus, Vec<String>) {
     let mut errors = Vec::new();
-    // Sai build/edition mà WinFreeUp đã từng áp dụng (có ảnh chụp, vd nâng Win 10 lên 11 hay đổi edition)
-    // ⇒ tính trạng thái thật như thường để mục vẫn hoàn tác được.
-    if let (Err(reason), false) = (supported(t, sys), undo.has_any(&t.id)) {
+    // Sai build/edition ⇒ «không hỗ trợ» với lý do thật, kể cả khi WinFreeUp đã từng áp dụng (có ảnh
+    // chụp). Khi đó giao diện dựa vào has_undo để cho hoàn tác; bộ máy cho Revert, không cho Apply.
+    if let Err(reason) = supported(t, sys) {
         // App không có trên máy thì ẩn luôn, kể cả khi sai build — «không hỗ trợ» chỉ hiện cho thứ đang có.
         let mut absent = t.group == Group::Bloatware;
         if absent {
@@ -337,19 +337,20 @@ ops = [
     }
 
     #[test]
-    fn unsupported_but_applied_by_us_reports_real_state_so_it_can_be_reverted() {
+    fn unsupported_but_applied_by_us_stays_unsupported_with_real_reason() {
         let (_d, mut u) = empty_undo();
         let t = tw("recall");
         let mut f = FakeOps::default().with_reg(r"HKLM\SOFTWARE\Policies\R", "v", RegData::Dword(1));
         f.sys.build = 22631;
         // Chưa từng áp dụng ⇒ vẫn «không hỗ trợ».
         assert_eq!(tweak_status(&t, &f.sys, &f, &u).0, TweakStatus::Unsupported { reason: "build_min:26100".into() });
-        // Đã áp dụng (có ảnh chụp) rồi đổi build/edition ⇒ tính trạng thái thật để còn hoàn tác.
+        // Đã áp dụng (có ảnh chụp) rồi đổi build/edition ⇒ vẫn «không hỗ trợ» với lý do thật; giao
+        // diện dùng has_undo để cho hoàn tác, bộ máy cho Revert (không cho Apply).
         u.record_if_absent("recall", 0, Snapshot::Registry { data: None });
-        assert_eq!(tweak_status(&t, &f.sys, &f, &u).0, TweakStatus::Applied);
+        assert_eq!(tweak_status(&t, &f.sys, &f, &u).0, TweakStatus::Unsupported { reason: "build_min:26100".into() });
         let mut g = FakeOps::default();
         g.sys.build = 22631;
-        assert_eq!(tweak_status(&t, &g.sys, &g, &u).0, TweakStatus::NotApplied);
+        assert_eq!(tweak_status(&t, &g.sys, &g, &u).0, TweakStatus::Unsupported { reason: "build_min:26100".into() });
     }
 
     #[test]
