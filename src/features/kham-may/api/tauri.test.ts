@@ -84,6 +84,19 @@ describe('khamMayTauriApi', () => {
     expect(unlisten).toHaveBeenCalledTimes(2);
   });
 
+  it('listen perf-error hỏng thì gỡ perf-tick, không gọi perf_start', async () => {
+    listen.mockImplementation(async (name: string) => {
+      if (name === 'perf-error') throw new Error('event plugin not ready');
+      return unlisten;
+    });
+    await expect(api.perfStart(() => {}, () => {})).rejects.toThrow('event plugin not ready');
+    expect(unlisten).toHaveBeenCalledTimes(1);
+    expect(invoke).not.toHaveBeenCalled();
+    invoke.mockResolvedValue(undefined);
+    await api.perfStop();
+    expect(unlisten).toHaveBeenCalledTimes(1);
+  });
+
   it('các lệnh đơn giản gửi đúng tên và tham số', async () => {
     invoke.mockResolvedValue(null);
     await api.diskVolumes();

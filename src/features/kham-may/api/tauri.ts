@@ -53,11 +53,11 @@ export const khamMayTauriApi: KhamMayApi = {
   perfStart: (onTick, onError) =>
     serial(async () => {
       perfUnlisten.forEach((u) => u());
-      perfUnlisten = [
-        await listen<PerfTick>('perf-tick', (e) => onTick(e.payload)),
-        await listen<string>('perf-error', (e) => onError(e.payload)),
-      ];
+      perfUnlisten = [];
+      // Ghi từng hàm gỡ ngay sau mỗi listen: listen thứ hai hỏng thì cái thứ nhất vẫn được gỡ.
       try {
+        perfUnlisten.push(await listen<PerfTick>('perf-tick', (e) => onTick(e.payload)));
+        perfUnlisten.push(await listen<string>('perf-error', (e) => onError(e.payload)));
         return await invoke<Sample[]>('perf_start');
       } catch (e) {
         perfUnlisten.forEach((u) => u());
