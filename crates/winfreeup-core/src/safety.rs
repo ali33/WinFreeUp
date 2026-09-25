@@ -6,10 +6,14 @@
 //! (`GetFinalPathNameByHandleW`) được kiểm lại với các gốc, rồi xóa qua handle
 //! (`SetFileInformationByHandle`). Thay thư mục cha bằng junction giữa hai bước không còn
 //! làm app xóa nhầm file ngoài gốc.
+//!
+//! Bản thân gốc cũng không được tin theo đường dẫn: `Guard::new` mở gốc bằng handle, loại gốc
+//! là liên kết hoặc có tổ tiên là liên kết, và giữ handle ghim gốc thư mục suốt đời Guard.
 use std::fs;
 use std::io;
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use crate::error::{io_err, CoreError, Result};
 
@@ -38,12 +42,44 @@ fn canonical_location(path: &Path) -> io::Result<PathBuf> {
 #[derive(Debug, Clone)]
 pub struct Guard {
     roots: Vec<PathBuf>,
+    rejected: Vec<PathBuf>,
+    /// Handle ghim các gốc, cùng thứ tự với `roots` (không `FILE_SHARE_DELETE`): suốt đời
+    /// Guard không ai đổi tên hay tráo được gốc. `Arc` vì Guard `Clone`; handle đóng khi bản
+    /// sao cuối bị drop, hoặc khi chính gốc đó được xóa (`remove_empty_dir`).
+    pins: Arc<Mutex<Vec<Option<fs::File>>>>,
+}
+
+/// Kết quả xét một gốc lúc dựng Guard.
+enum RootCheck {
+    Accepted(PathBuf, Option<fs::File>),
+    Missing,
+    Rejected,
 }
 
 impl Guard {
-    /// Gốc không tồn tại bị bỏ qua (không có gì để xóa ở đó).
+    /// Gốc không tồn tại bị bỏ qua (không có gì để xóa ở đó). Gốc bản thân là reparse point,
+    /// hoặc có tổ tiên là junction/symlink (đường dẫn thật lệch đường dẫn chữ), bị loại —
+    /// xem `rejected_roots`. Không tin `canonicalize` vì gốc như %TEMP% thuộc quyền người dùng.
     pub fn new(roots: &[PathBuf]) -> Guard {
-        Guard { roots: roots.iter().filter_map(|r| fs::canonicalize(r).ok()).collect() }
+        let mut accepted = Vec::new();
+        let mut rejected = Vec::new();
+        let mut pins = Vec::new();
+        for r in roots {
+            match check_root(r) {
+                RootCheck::Accepted(real, pin) => {
+                    accepted.push(real);
+                    pins.push(pin);
+                }
+                RootCheck::Missing => {}
+                RootCheck::Rejected => rejected.push(r.clone()),
+            }
+        }
+        Guard { roots: accepted, rejected, pins: Arc::new(Mutex::new(pins)) }
+    }
+
+    /// Các gốc bị loại vì là liên kết hoặc nằm dưới liên kết: không xóa gì dưới chúng.
+    pub fn rejected_roots(&self) -> &[PathBuf] {
+        &self.rejected
     }
 
     pub fn is_allowed(&self, path: &Path) -> bool {
@@ -53,10 +89,21 @@ impl Guard {
         }
     }
 
-    /// So một đường dẫn ĐÃ là đường dẫn thật (dạng `\\?\` như `fs::canonicalize` trả về)
+    /// So một đường dẫn ĐÃ là đường dẫn thật (dạng `\\?\` từ `GetFinalPathNameByHandleW`)
     /// với các gốc — thuần so chuỗi, không chạm hệ thống file nên không bị tráo giữa chừng.
     fn contains_final(&self, final_path: &Path) -> bool {
         self.roots.iter().any(|r| final_path.starts_with(r))
+    }
+
+    /// Xóa chính một gốc thì phải thả handle ghim của nó trước (handle ghim chặn DELETE).
+    /// Việc xóa sau đó vẫn qua handle và kiểm lại đường dẫn thật như mọi đường xóa khác.
+    fn release_pin_if_root(&self, dir: &Path) {
+        let Ok(loc) = canonical_location(dir) else { return };
+        let Some(i) = self.roots.iter().position(|r| same_path_ci(r, &loc)) else { return };
+        let mut pins = self.pins.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pin) = pins.get_mut(i) {
+            pin.take();
+        }
     }
 
     pub fn check(&self, path: &Path) -> Result<()> {
@@ -107,18 +154,17 @@ fn open_for_delete(path: &Path) -> io::Result<fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
         DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
     fs::OpenOptions::new()
-        // FILE_WRITE_ATTRIBUTES: chỉ để đường lùi bỏ cờ read-only qua handle trên Windows cũ.
-        .access_mode(DELETE | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES)
+        .access_mode(DELETE | FILE_READ_ATTRIBUTES)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)
 }
 
 /// Đường dẫn thật của đối tượng mà handle đang trỏ tới, dạng `\\?\C:\...` / `\\?\UNC\...`
-/// — cùng dạng với gốc đã `fs::canonicalize` trong `Guard`.
+/// — cùng dạng với gốc lưu trong `Guard` (cũng lấy bằng hàm này).
 #[cfg(windows)]
 fn final_path(file: &fs::File) -> io::Result<PathBuf> {
     use std::ffi::OsString;
@@ -149,6 +195,110 @@ fn final_path(file: &fs::File) -> io::Result<PathBuf> {
         // Thiếu chỗ: `n` là số phần tử cần (kể cả NUL).
         buf.resize(n + 1, 0);
     }
+}
+
+/// Ghim một gốc: chỉ đọc thuộc tính, không đi theo reparse point, share R|W nhưng KHÔNG
+/// `FILE_SHARE_DELETE` ⇒ không ai đổi tên / xóa / tráo được gốc khi handle còn mở.
+#[cfg(windows)]
+fn open_root_pin(path: &Path) -> io::Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    fs::OpenOptions::new()
+        // Phải có quyền mức dữ liệu (LIST_DIRECTORY): handle chỉ-thuộc-tính không được
+        // NTFS xét chế độ chia sẻ, tức không ghim được gì.
+        .access_mode(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+}
+
+/// Đường dẫn CHỮ của gốc: tuyệt đối, dạng `\\?\`, đã khử tên 8.3 (`GetLongPathNameW`).
+/// Không phân giải liên kết, nên lệch với `final_path` ⇔ có junction/symlink trên đường đi.
+#[cfg(windows)]
+fn literal_long_path(path: &Path) -> io::Result<PathBuf> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows_sys::Win32::Storage::FileSystem::GetLongPathNameW;
+    let abs: Vec<u16> = std::path::absolute(path)?.as_os_str().encode_wide().collect();
+    let verbatim: Vec<u16> = r"\\?\".encode_utf16().collect();
+    let unc: Vec<u16> = r"\\".encode_utf16().collect();
+    let mut wide: Vec<u16> = if abs.starts_with(&verbatim) {
+        abs
+    } else if abs.starts_with(&unc) {
+        // `\\server\share` ⇒ `\\?\UNC\server\share`
+        let mut v: Vec<u16> = r"\\?\UNC".encode_utf16().collect();
+        v.extend_from_slice(&abs[1..]);
+        v
+    } else {
+        let mut v = verbatim;
+        v.extend_from_slice(&abs);
+        v
+    };
+    wide.push(0);
+    let mut buf: Vec<u16> = vec![0; wide.len().max(512)];
+    loop {
+        let cap = u32::try_from(buf.len()).unwrap_or(u32::MAX);
+        // SAFETY: `wide` kết thúc bằng NUL; `buf` ghi được `cap` phần tử u16.
+        let n = unsafe { GetLongPathNameW(wide.as_ptr(), buf.as_mut_ptr(), cap) } as usize;
+        if n == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if n < buf.len() {
+            buf.truncate(n);
+            return Ok(PathBuf::from(OsString::from_wide(&buf)));
+        }
+        buf.resize(n + 1, 0);
+    }
+}
+
+/// So hai đường dẫn không phân biệt hoa/thường, bỏ qua dấu `\` cuối.
+fn same_path_ci(a: &Path, b: &Path) -> bool {
+    let norm = |p: &Path| p.to_string_lossy().trim_end_matches('\\').to_lowercase();
+    norm(a) == norm(b)
+}
+
+/// Xét một gốc: phải tồn tại, không phải reparse point, và đường dẫn thật của handle
+/// trùng đường dẫn chữ (không có liên kết ở tổ tiên). Handle trả về để ghim gốc.
+#[cfg(windows)]
+fn check_root(root: &Path) -> RootCheck {
+    let pin = match open_root_pin(root) {
+        Ok(f) => f,
+        Err(e) if is_vanished(&e) => return RootCheck::Missing,
+        Err(_) => return RootCheck::Rejected,
+    };
+    let is_dir = match pin.metadata() {
+        Ok(m) if !is_reparse_point(&m) => m.is_dir(),
+        _ => return RootCheck::Rejected,
+    };
+    let (Ok(real), Ok(literal)) = (final_path(&pin), literal_long_path(root)) else {
+        return RootCheck::Rejected;
+    };
+    if same_path_ci(&real, &literal) {
+        // Gốc là file (vd MEMORY.DMP): không ghim, để chính nó xóa được; việc xóa vẫn
+        // kiểm lại đường dẫn thật qua handle.
+        RootCheck::Accepted(real, is_dir.then_some(pin))
+    } else {
+        RootCheck::Rejected
+    }
+}
+
+/// Số hard link của file mà handle trỏ tới.
+#[cfg(windows)]
+fn link_count(file: &fs::File) -> io::Result<u32> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    // SAFETY: struct POD toàn số — mọi bit 0 đều hợp lệ.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: handle sống suốt lời gọi; `info` là vùng ghi hợp lệ đúng kiểu.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(info.nNumberOfLinks)
 }
 
 #[cfg(windows)]
@@ -204,26 +354,61 @@ fn dispose(file: &fs::File, attrs: u32) -> io::Result<()> {
     }
 }
 
-/// Đường lùi: tự bỏ read-only qua handle (nếu có) rồi đặt `FileDispositionInfo`.
+/// Đường lùi: tự bỏ read-only (nếu có) qua một handle mở lại từ chính handle đang giữ
+/// (`ReOpenFile` + `FILE_WRITE_ATTRIBUTES`, không đi lại đường dẫn), rồi đặt
+/// `FileDispositionInfo`. Đặt cờ xóa lỗi ⇒ trả lại thuộc tính cũ.
 #[cfg(windows)]
 fn dispose_legacy(file: &fs::File, attrs: u32) -> io::Result<()> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::Storage::FileSystem::{
-        FileBasicInfo, FileDispositionInfo, FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO,
-        FILE_DISPOSITION_INFO,
+        FileBasicInfo, FileDispositionInfo, ReOpenFile, FILE_ATTRIBUTE_ARCHIVE,
+        FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_NOT_CONTENT_INDEXED,
+        FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_SYSTEM, FILE_ATTRIBUTE_TEMPORARY, FILE_BASIC_INFO,
+        FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES,
     };
-    if attrs & FILE_ATTRIBUTE_READONLY != 0 {
-        let cleared = attrs & !FILE_ATTRIBUTE_READONLY;
-        // Thời gian = 0 nghĩa là "giữ nguyên"; thuộc tính 0 cũng là "giữ nguyên" nên dùng NORMAL.
-        let basic = FILE_BASIC_INFO {
-            CreationTime: 0,
-            LastAccessTime: 0,
-            LastWriteTime: 0,
-            ChangeTime: 0,
-            FileAttributes: if cleared == 0 { FILE_ATTRIBUTE_NORMAL } else { cleared },
-        };
-        set_info(file, FileBasicInfo, &basic)?;
+    // Chỉ các bit FileBasicInfo đặt được; DIRECTORY/REPARSE_POINT… là bit chỉ đọc.
+    const SETTABLE: u32 = FILE_ATTRIBUTE_READONLY
+        | FILE_ATTRIBUTE_HIDDEN
+        | FILE_ATTRIBUTE_SYSTEM
+        | FILE_ATTRIBUTE_ARCHIVE
+        | FILE_ATTRIBUTE_TEMPORARY
+        | FILE_ATTRIBUTE_OFFLINE
+        | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED;
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    if attrs & FILE_ATTRIBUTE_READONLY == 0 {
+        return set_info(file, FileDispositionInfo, &disposition);
     }
-    set_info(file, FileDispositionInfo, &FILE_DISPOSITION_INFO { DeleteFile: true })
+    // Thời gian = 0 nghĩa là "giữ nguyên"; thuộc tính 0 cũng là "giữ nguyên" nên dùng NORMAL.
+    let basic = |a: u32| FILE_BASIC_INFO {
+        CreationTime: 0,
+        LastAccessTime: 0,
+        LastWriteTime: 0,
+        ChangeTime: 0,
+        FileAttributes: if a == 0 { FILE_ATTRIBUTE_NORMAL } else { a },
+    };
+    // SAFETY: handle gốc sống suốt lời gọi; ReOpenFile không lấy quyền sở hữu nó.
+    let raw = unsafe {
+        ReOpenFile(
+            file.as_raw_handle(),
+            FILE_WRITE_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+        )
+    };
+    if raw == INVALID_HANDLE_VALUE || raw.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `raw` là handle hợp lệ vừa mở, chưa ai sở hữu; `File` đóng nó khi drop.
+    let writer = unsafe { fs::File::from_raw_handle(raw) };
+    let original = attrs & SETTABLE;
+    set_info(&writer, FileBasicInfo, &basic(original & !FILE_ATTRIBUTE_READONLY))?;
+    let r = set_info(file, FileDispositionInfo, &disposition);
+    if r.is_err() {
+        let _ = set_info(&writer, FileBasicInfo, &basic(original));
+    }
+    r
 }
 
 /// Lõi xóa chống TOCTOU: mở handle → kiểm lại đường dẫn thật với gốc → xóa qua handle.
@@ -246,7 +431,9 @@ fn delete_checked_by_handle(guard: &Guard, path: &Path) -> Result<DeleteOutcome>
             path.display()
         )));
     }
-    let bytes = if reparse { 0 } else { meta.len() };
+    // Hard link: xóa một tên không giải phóng dữ liệu khi còn tên khác trỏ tới.
+    let shared = !reparse && link_count(&file).map_err(|e| io_err(path, e))? > 1;
+    let bytes = if reparse || shared { 0 } else { meta.len() };
     match dispose(&file, meta.file_attributes()) {
         Ok(()) => Ok(DeleteOutcome::Deleted(bytes)),
         Err(e) => classify(path, e),
@@ -292,7 +479,11 @@ fn remove_empty_dir_checked(guard: &Guard, dir: &Path) -> bool {
 
 /// Xóa thư mục nếu rỗng, nằm trong gốc được phép và không phải reparse point.
 pub fn remove_empty_dir(guard: &Guard, dir: &Path) -> bool {
-    guard.is_allowed(dir) && remove_empty_dir_checked(guard, dir)
+    if !guard.is_allowed(dir) {
+        return false;
+    }
+    guard.release_pin_if_root(dir);
+    remove_empty_dir_checked(guard, dir)
 }
 
 #[cfg(test)]
@@ -471,6 +662,75 @@ mod tests {
         let guard = Guard::new(&[root]);
         assert_eq!(delete_checked_by_handle(&guard, &f).unwrap(), DeleteOutcome::Deleted(6));
         assert!(!f.exists());
+    }
+
+    /// %TEMP% (thuộc quyền người dùng) là junction → nơi khác đúng lúc dựng Guard:
+    /// gốc phải bị loại, không được lưu đích của junction làm gốc.
+    #[test]
+    fn root_that_is_a_junction_at_guard_creation_is_rejected() {
+        let (t, _root, outside) = setup();
+        let secret = write_file(&outside.join("secret.txt"), 5);
+        let fake_root = t.path().join("fake_temp");
+        junction::create(&outside, &fake_root).unwrap();
+        let guard = Guard::new(std::slice::from_ref(&fake_root));
+        assert_eq!(guard.rejected_roots(), std::slice::from_ref(&fake_root));
+        for p in [fake_root.join("secret.txt"), outside.join("secret.txt")] {
+            assert!(matches!(delete_path(&guard, &p, false), Err(CoreError::OutsideRoots(_))));
+            assert!(matches!(
+                delete_checked_by_handle(&guard, &p),
+                Err(CoreError::OutsideRoots(_))
+            ));
+        }
+        assert!(secret.exists());
+    }
+
+    #[test]
+    fn root_below_a_junction_ancestor_is_rejected() {
+        let (t, _root, outside) = setup();
+        let real_root = outside.join("cache");
+        let secret = write_file(&real_root.join("secret.txt"), 5);
+        let ancestor = t.path().join("appdata_link");
+        junction::create(&outside, &ancestor).unwrap();
+        let root_via_link = ancestor.join("cache");
+        let guard = Guard::new(std::slice::from_ref(&root_via_link));
+        assert_eq!(guard.rejected_roots(), std::slice::from_ref(&root_via_link));
+        let p = root_via_link.join("secret.txt");
+        assert!(matches!(delete_path(&guard, &p, false), Err(CoreError::OutsideRoots(_))));
+        assert!(secret.exists());
+    }
+
+    #[test]
+    fn plain_root_is_accepted_and_pinned_against_rename() {
+        let (t, root, _o) = setup();
+        let guard = Guard::new(std::slice::from_ref(&root));
+        assert!(guard.rejected_roots().is_empty());
+        let clone = guard.clone();
+        drop(guard);
+        let moved = t.path().join("moved");
+        assert!(fs::rename(&root, &moved).is_err(), "gốc đang được ghim");
+        drop(clone);
+        fs::rename(&root, &moved).unwrap();
+    }
+
+    #[test]
+    fn hard_linked_file_is_deleted_but_frees_nothing() {
+        let (_t, root, _o) = setup();
+        let f = write_file(&root.join("a.tmp"), 9);
+        let twin = root.join("b.tmp");
+        fs::hard_link(&f, &twin).unwrap();
+        let guard = Guard::new(&[root]);
+        assert_eq!(delete_checked_by_handle(&guard, &f).unwrap(), DeleteOutcome::Deleted(0));
+        assert!(!f.exists());
+        assert_eq!(fs::metadata(&twin).unwrap().len(), 9);
+    }
+
+    #[test]
+    fn missing_file_on_handle_path_is_vanished() {
+        let (_t, root, _o) = setup();
+        let guard = Guard::new(std::slice::from_ref(&root));
+        for p in [root.join("gone.tmp"), root.join("no_dir").join("gone.tmp")] {
+            assert_eq!(delete_checked_by_handle(&guard, &p).unwrap(), DeleteOutcome::Vanished);
+        }
     }
 
     #[test]
