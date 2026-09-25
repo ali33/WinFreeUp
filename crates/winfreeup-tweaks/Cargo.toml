@@ -1,0 +1,37 @@
+[package]
+name = "winfreeup-tweaks"
+version = "0.1.0"
+edition = "2021"
+
+# Tách khỏi workspace gốc cho tới Task 12 (Tích hợp) — Cargo.toml gốc do v0.1 sở hữu. Task 12 xoá bảng này.
+[workspace]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+  "ApplicationModel",
+  "Foundation",
+  "Foundation_Collections",
+  "Management_Deployment",
+  "Win32_Foundation",
+  "Win32_NetworkManagement_NetManagement",
+  "Win32_Security",
+  "Win32_System_Com",
+  "Win32_System_Ole",
+  "Win32_System_Registry",
+  "Win32_System_RemoteDesktop",
+  "Win32_System_Services",
+  "Win32_System_TaskScheduler",
+  "Win32_System_Variant",
+  "Win32_System_WindowsProgramming",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
+] }
+windows-future = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
