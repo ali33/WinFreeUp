@@ -4,10 +4,9 @@ import { Busy } from '../../components/Busy';
 import { createStore } from '../../state/store';
 import * as c from './controller';
 import { ConfirmTweaks, RestorePrompt } from './Dialogs';
-import { itemName } from './labels';
 import { currentPreset, LEVELS, pendingChanges, revertable } from './presets';
 import { initialTState, reducer, type Phase } from './reducer';
-import { RunPanel, runLabel } from './RunPanel';
+import { RunPanel, runLabel, spokenLabel } from './RunPanel';
 import { tt } from './strings';
 import { TweakList } from './TweakList';
 import type { TweakApi } from './types';
@@ -38,12 +37,17 @@ export function TinhChinhView({ api, notify, dryRun, onBusyChange }: TinhChinhPr
   };
 
   // Đóng kết quả / dừng sau điểm khôi phục hỏng / lượt chạy hỏng ⇒ focus về nút Áp dụng, không rơi về body.
+  // Đọc lại hỏng (chưa có dữ liệu) ⇒ nút Áp dụng không được vẽ ⇒ focus về nút Thử lại thay thế.
   const applyBtn = useRef<HTMLButtonElement>(null);
+  const retryBtn = useRef<HTMLButtonElement>(null);
   const prevPhase = useRef<Phase>(s.phase);
   useEffect(() => {
     const from = prevPhase.current;
     prevPhase.current = s.phase;
-    if (s.phase === 'ready' && (from === 'done' || from === 'restorePoint' || from === 'running')) applyBtn.current?.focus();
+    if (s.phase === 'ready' && (from === 'done' || from === 'restorePoint' || from === 'running')) {
+      if (applyBtn.current) applyBtn.current.focus();
+      else retryBtn.current?.focus();
+    }
   }, [s.phase]);
 
   const data = s.data;
@@ -57,15 +61,7 @@ export function TinhChinhView({ api, notify, dryRun, onBusyChange }: TinhChinhPr
   const creating = s.phase === 'restorePoint' && s.restore === null;
   const status = creating ? tt('tweaks.restore.creating') : (runLabel(s) ?? (s.reloading ? tt('tweaks.reloading') : null));
   // Trình đọc màn hình: chỉ báo khi đổi việc / đổi mục, không đọc lại «i/n» ở mỗi sự kiện.
-  const spoken = creating
-    ? tt('tweaks.restore.creating')
-    : s.phase === 'running'
-      ? s.run?.current
-        ? itemName(s.run.current)
-        : ''
-      : s.reloading
-        ? tt('tweaks.reloading')
-        : '';
+  const spoken = spokenLabel(s);
 
   // RunPanel luôn là con đầu của .tc-root ở mọi nhánh ⇒ không bị dựng lại khi dữ liệu bị dọn
   // (giữ trạng thái đang khởi động lại Explorer và focus). Lệch có chủ ý: bảng kết quả nằm trên cùng.
@@ -79,7 +75,9 @@ export function TinhChinhView({ api, notify, dryRun, onBusyChange }: TinhChinhPr
           <div className="tc-section">
             <div className="tc-row-error">{tt('tweaks.errors.loadFailed', { message: s.loadError })}</div>
             <div className="wfu-actions">
-              <Button onClick={() => run(c.load(d))}>{tt('tweaks.retry')}</Button>
+              <Button ref={retryBtn} onClick={() => run(c.load(d))}>
+                {tt('tweaks.retry')}
+              </Button>
             </div>
           </div>
         ) : (

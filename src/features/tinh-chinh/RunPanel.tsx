@@ -14,6 +14,17 @@ export function runLabel(state: TState): string | null {
 }
 
 /**
+ * Nhãn cho trình đọc màn hình (.tc-sr): chỉ báo khi đổi việc / đổi mục, không đọc lại «i/n» ở mỗi sự kiện.
+ * TinhChinhView đặt kết quả vào vùng aria-live="polite" ở chân trang.
+ */
+export function spokenLabel(state: TState): string {
+  if (state.phase === 'restorePoint' && state.restore === null) return tt('tweaks.restore.creating');
+  if (state.phase === 'running') return state.run?.current ? itemName(state.run.current) : '';
+  if (state.reloading) return tt('tweaks.reloading');
+  return '';
+}
+
+/**
  * Kết quả từng mục (lỗi nguyên văn) và việc cần khởi động lại khi xong. Kết quả hiện ⇒ cuộn tới và đặt focus vào
  * khung (region mang tên «Kết quả»); vì đã nhận focus nên không dùng aria-live, tránh trình đọc màn hình đọc hai lần.
  * TinhChinhView giữ component này ở cùng vị trí con ở mọi nhánh để `restarting` không bị mất khi dữ liệu bị dọn.

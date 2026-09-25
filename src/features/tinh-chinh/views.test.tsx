@@ -313,6 +313,22 @@ describe('TinhChinhView', () => {
     await waitFor(() => expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Áp dụng 1 thay đổi' })));
   });
 
+  // Rà lần 3 (LOW): đọc lại hỏng khi đang xem kết quả ⇒ không có dữ liệu ⇒ nút Áp dụng không được vẽ ⇒
+  // đóng kết quả phải focus về nút Đọc lại, không rơi về body.
+  it('đọc lại hỏng khi đang xem kết quả, đóng kết quả ⇒ focus về nút Đọc lại (không có nút Áp dụng)', async () => {
+    const read = vi.fn().mockResolvedValueOnce(readResult()).mockRejectedValueOnce('Access is denied.');
+    const api = fakeApi({ read });
+    wrap(<TinhChinhView api={api} notify={vi.fn()} dryRun={false} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Áp dụng 1 thay đổi' }));
+    expect(await screen.findByText('Không đọc được trạng thái máy: Access is denied.')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /^Áp dụng/ })).toBeNull();
+    const close = await screen.findByRole('button', { name: 'Đóng' });
+    await waitFor(() => expect(off(close)).toBe(false));
+    close.focus();
+    fireEvent.click(close);
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Đọc lại' })));
+  });
+
   // Rà lần 2 (LOW): khung kết quả là vùng có tên, không phải aria-live (đã nhận focus ⇒ không đọc hai lần).
   it('khung kết quả là region mang tên «Kết quả», không aria-live', async () => {
     wrap(<TinhChinhView api={fakeApi()} notify={vi.fn()} dryRun={false} />);
