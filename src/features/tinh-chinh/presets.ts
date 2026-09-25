@@ -15,6 +15,19 @@ export function selectable(t: TweakView): boolean {
   return t.status === 'applied' || t.status === 'not_applied' || t.status === 'partial';
 }
 
+/**
+ * Mục sai build/edition mà WinFreeUp đã áp dụng trước đó (có ảnh chụp) ⇒ chỉ được hoàn tác: tích được,
+ * nhưng không vào mức sẵn, lựa chọn mặc định hay số thay đổi. Lệch có chủ ý so với kế hoạch (yêu cầu sau rà Task 11).
+ */
+export function revertOnly(t: TweakView): boolean {
+  return t.status === 'unsupported' && t.has_undo;
+}
+
+/** Ô tích bật được: mục bình thường hoặc mục chỉ hoàn tác. */
+export function checkable(t: TweakView): boolean {
+  return selectable(t) || revertOnly(t);
+}
+
 /** Bấm mức sẵn ⇒ tích mọi mục có `level` ≤ mức đó (spec mục 5), theo thứ tự danh mục. */
 export function presetSelection(tweaks: TweakView[], level: TweakLevel): string[] {
   return tweaks.filter((t) => selectable(t) && rank(t.level) <= rank(level)).map((t) => t.id);
@@ -37,8 +50,11 @@ function sameSet(a: string[], b: string[]): boolean {
 
 /** Mức đang khớp đúng tập đã tích; không khớp mức nào ⇒ `custom` («Tùy chỉnh»). Trùng nhiều mức ⇒ mức thấp nhất. */
 export function currentPreset(tweaks: TweakView[], selected: string[]): Preset {
-  if (selected.length === 0) return 'custom';
-  return LEVELS.find((l) => sameSet(presetSelection(tweaks, l), selected)) ?? 'custom';
+  // Mục chỉ hoàn tác không thuộc mức nào ⇒ bỏ qua khi so.
+  const ro = new Set(tweaks.filter(revertOnly).map((t) => t.id));
+  const picked = selected.filter((id) => !ro.has(id));
+  if (picked.length === 0) return 'custom';
+  return LEVELS.find((l) => sameSet(presetSelection(tweaks, l), picked)) ?? 'custom';
 }
 
 /** Số thay đổi thật: mục đã tích mà chưa ở trạng thái đích. */
@@ -51,7 +67,7 @@ export function pendingChanges(tweaks: TweakView[], selected: string[]): string[
 export function revertable(tweaks: TweakView[], selected: string[]): string[] {
   const s = new Set(selected);
   return tweaks
-    .filter((t) => s.has(t.id) && selectable(t) && (t.has_undo || t.status === 'applied' || t.status === 'partial'))
+    .filter((t) => s.has(t.id) && (revertOnly(t) || (selectable(t) && (t.has_undo || t.status === 'applied' || t.status === 'partial'))))
     .map((t) => t.id);
 }
 

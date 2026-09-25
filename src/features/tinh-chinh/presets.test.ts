@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { currentPreset, defaultSelection, needsConfirm, pendingChanges, presetSelection, revertable, selectable, visible } from './presets';
+import { currentPreset, defaultSelection, needsConfirm, pendingChanges, presetSelection, revertable, revertOnly, selectable, visible } from './presets';
 import { sample, tw } from './testdata';
+import type { TweakView } from './types';
 
 const all = sample();
 
@@ -80,5 +81,29 @@ describe('hộp xác nhận', () => {
     expect(needsConfirm(all, ['ads_id', 'svc_diagtrack', 'app_weather'], false).map((t) => t.id)).toEqual(['svc_diagtrack']);
     expect(needsConfirm(all, ['ads_id', 'svc_diagtrack', 'app_weather'], true).map((t) => t.id)).toEqual(['svc_diagtrack', 'app_weather']);
     expect(needsConfirm(all, ['ads_id'], false)).toEqual([]);
+  });
+});
+
+// Lệch có chủ ý (yêu cầu sau rà Task 11): mục sai build/edition mà WinFreeUp đã áp dụng trước đó ⇒ chỉ được hoàn tác.
+describe('mục chỉ hoàn tác', () => {
+  const ro = tw('old_tweak', { status: 'unsupported', reason: 'build_max:19045', has_undo: true } as Partial<TweakView>);
+  const list = [...sample(), ro];
+
+  it('nhận ra mục không hỗ trợ mà có ảnh chụp; mục không hỗ trợ thường thì không', () => {
+    expect(revertOnly(ro)).toBe(true);
+    expect(revertOnly(list.find((t) => t.id === 'recall_off')!)).toBe(false);
+    expect(revertOnly(tw('x', { has_undo: true }))).toBe(false);
+  });
+
+  it('không vào mức sẵn, lựa chọn mặc định, số thay đổi; có vào hoàn tác', () => {
+    for (const l of ['basic', 'recommended', 'aggressive'] as const) expect(presetSelection(list, l)).not.toContain('old_tweak');
+    expect(defaultSelection(list)).not.toContain('old_tweak');
+    expect(pendingChanges(list, ['old_tweak'])).toEqual([]);
+    expect(revertable(list, ['old_tweak'])).toEqual(['old_tweak']);
+  });
+
+  it('tích thêm mục chỉ hoàn tác không làm đổi mức sẵn đang khớp', () => {
+    expect(currentPreset(list, [...presetSelection(list, 'basic'), 'old_tweak'])).toBe('basic');
+    expect(currentPreset(list, ['old_tweak'])).toBe('custom');
   });
 });

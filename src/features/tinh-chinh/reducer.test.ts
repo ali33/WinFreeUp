@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { initialTState, reducer, type TAction, type TState } from './reducer';
-import { readResult, report, sample } from './testdata';
+import { readResult, report, sample, tw } from './testdata';
+import type { TweakView } from './types';
 
 const run = (actions: TAction[], from: TState = initialTState) => actions.reduce(reducer, from);
 const loaded = () => run([{ type: 'LOAD_STARTED' }, { type: 'LOADED', data: readResult() }]);
@@ -87,6 +88,13 @@ describe('luồng áp dụng', () => {
     expect(s.phase).toBe('confirm');
   });
 
+  // Lệch có chủ ý (rà Task 11, L3): chạy bằng tài khoản admin khác ⇒ luôn hỏi lại trước khi áp dụng.
+  it('chạy bằng tài khoản admin khác ⇒ luôn hỏi trước', () => {
+    const data = readResult(undefined, { system: { build: 26200, edition: 'Pro', managed: false, other_user: true } });
+    const s = run([{ type: 'LOAD_STARTED' }, { type: 'LOADED', data }, { type: 'REQUEST_APPLY' }]);
+    expect(s.phase).toBe('confirm');
+  });
+
   it('không tạo được điểm khôi phục ⇒ chờ người dùng chọn tiếp hay dừng', () => {
     let s = run([{ type: 'REQUEST_APPLY' }, { type: 'RESTORE_RESULT', status: { status: 'failed', message: 'System Protection is off' } }], loaded());
     expect(s.phase).toBe('restorePoint');
@@ -115,5 +123,33 @@ describe('luồng áp dụng', () => {
     const s = reducer(loaded(), { type: 'LOAD_STARTED' });
     expect(s.reloading).toBe(true);
     expect(reducer(s, { type: 'RUN_STARTED', kind: 'revert', ids: ['app_clipchamp'] })).toBe(s);
+  });
+});
+
+// Lệch có chủ ý (yêu cầu sau rà Task 11): mục chỉ hoàn tác tích được, và đọc lại không bỏ nó khỏi lựa chọn.
+describe('mục chỉ hoàn tác', () => {
+  const data = readResult([...sample(), tw('old_tweak', { status: 'unsupported', reason: 'build_max:19045', has_undo: true } as Partial<TweakView>)]);
+  it('tích được và giữ qua lần đọc lại', () => {
+    let s = run([{ type: 'LOAD_STARTED' }, { type: 'LOADED', data }]);
+    expect(s.selected).not.toContain('old_tweak');
+    s = reducer(s, { type: 'TOGGLE', id: 'old_tweak' });
+    expect(s.selected).toContain('old_tweak');
+    s = run([{ type: 'LOAD_STARTED' }, { type: 'LOADED', data }], s);
+    expect(s.selected).toContain('old_tweak');
+  });
+});
+
+// Lệch có chủ ý (rà lần 2 Task 11): đọc lại khi đang ở bảng kết quả mà chưa có dữ liệu ⇒ không mất bảng kết quả.
+describe('đọc lại khi đang xem kết quả', () => {
+  it('LOAD_STARTED giữ phase done khi dữ liệu đã bị dọn', () => {
+    let s = run([{ type: 'REQUEST_APPLY' }, { type: 'RESTORE_RESULT', status: { status: 'created' } }, { type: 'RUN_STARTED', kind: 'apply', ids: ['ads_id'] }, { type: 'RUN_DONE', report: report() }], loaded());
+    s = run([{ type: 'LOAD_STARTED' }, { type: 'LOAD_FAILED', message: 'x' }], s);
+    expect(s.phase).toBe('done');
+    expect(s.data).toBeNull();
+    s = reducer(s, { type: 'LOAD_STARTED' });
+    expect(s.phase).toBe('done');
+    expect(s.report).not.toBeNull();
+    s = reducer(s, { type: 'LOADED', data: readResult() });
+    expect(s.phase).toBe('done');
   });
 });

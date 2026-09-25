@@ -36,6 +36,15 @@ describe('nhãn', () => {
     expect(outcomeText(o('not_applied'), 'revert')).toBe('✓ Xong');
   });
 
+  // Lệch có chủ ý (rà Task 11, L7): đã tới trạng thái đích mà còn lỗi phụ (vd dọn ảnh chụp `undo_save … read-only`)
+  // ⇒ ⚠ một phần, không phải ✗ — máy đã đổi đúng.
+  it('đã tới đích nhưng còn lỗi ⇒ ⚠, chưa tới đích ⇒ ✗', () => {
+    const o = (status: 'applied' | 'not_applied', errors: string[]) => ({ id: 'x', status, errors, store_opened: [] }) as never;
+    expect(outcomeText(o('applied', ['x: undo_save: read-only']), 'apply')).toBe('⚠ Một phần');
+    expect(outcomeText(o('not_applied', ['x: undo_save: read-only']), 'revert')).toBe('⚠ Một phần');
+    expect(outcomeText(o('applied', ['x#0: Access is denied.']), 'revert')).toBe('✗ Lỗi');
+  });
+
   it('không có chuỗi rỗng, và khoá UI không trùng khoá danh mục', () => {
     for (const [k, v] of Object.entries({ ...ui, ...catalogVi })) expect(v.trim(), k).not.toBe('');
     for (const k of Object.keys(ui)) expect(k in catalogVi, k).toBe(false);

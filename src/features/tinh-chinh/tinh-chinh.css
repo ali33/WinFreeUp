@@ -1,0 +1,166 @@
+/* Tab Tinh chỉnh. Dùng lại .wfu-muted, .wfu-actions, .wfu-canhbao, .wfu-busy của src/styles.css. */
+.tc-root {
+  display: grid;
+  gap: 16px;
+}
+
+.tc-presets {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.tc-custom {
+  font-weight: 600;
+  padding: 0 8px;
+}
+
+.tc-section {
+  display: grid;
+  gap: 8px;
+}
+
+.tc-section-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.tc-rows,
+.tc-results {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.tc-row {
+  display: grid;
+  grid-template-columns: auto 1fr auto auto auto;
+  align-items: center;
+  gap: 4px 12px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  border: 1px solid color-mix(in srgb, currentColor 14%, transparent);
+}
+
+.tc-row-off {
+  opacity: 0.55;
+}
+
+.tc-row-main {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.tc-row-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+}
+
+.tc-row-error {
+  font-size: 12px;
+  color: #c50f1f;
+  white-space: pre-wrap;
+}
+
+.tc-level {
+  font-size: 12px;
+  opacity: 0.75;
+  white-space: nowrap;
+}
+
+.tc-status {
+  white-space: nowrap;
+}
+
+.tc-warn {
+  color: #bc4b09;
+}
+
+.tc-list {
+  position: relative;
+  display: grid;
+  gap: 16px;
+}
+
+/* Đọc lại: giữ nội dung cũ mờ bên dưới, không xoá trắng. */
+.tc-dim > .tc-section {
+  opacity: 0.45;
+  pointer-events: none;
+}
+
+.tc-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 24px;
+  z-index: 1;
+}
+
+/* Vòng quay đọc lại luôn ở giữa khung nhìn, không kẹt ở đầu danh sách dài. */
+.tc-overlay > .wfu-busy {
+  position: sticky;
+  top: 40vh;
+}
+
+.tc-panel {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border-radius: 6px;
+  border: 1px solid color-mix(in srgb, currentColor 20%, transparent);
+}
+
+.tc-result-mark {
+  font-weight: 600;
+}
+
+.tc-footer {
+  display: grid;
+  gap: 8px;
+  position: sticky;
+  bottom: 0;
+  padding: 8px 0;
+  background: var(--colorNeutralBackground1);
+  z-index: 2;
+}
+
+.tc-footer-status {
+  display: flex;
+  align-items: center;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* Chỉ cho trình đọc màn hình. */
+.tc-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+.tc-panel:focus {
+  outline: 2px solid var(--colorStrokeFocus2);
+  outline-offset: 2px;
+}
+
+@media (prefers-color-scheme: dark) {
+  .tc-row-error {
+    color: #f1707b;
+  }
+  .tc-warn {
+    color: #fdb983;
+  }
+}

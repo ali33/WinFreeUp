@@ -46,9 +46,15 @@ export function statusText(t: TweakView): string {
   }
 }
 
-/** ✓ khi không lỗi và (áp dụng xong hoặc hoàn tác xong); ⚠ khi còn một phần; ✗ khi có lỗi. */
+/**
+ * ✓ khi không lỗi và (áp dụng xong hoặc hoàn tác xong); ⚠ khi còn một phần, hoặc đã tới trạng thái đích mà
+ * còn lỗi phụ (vd không dọn được ảnh chụp — máy đã đổi đúng); ✗ khi có lỗi và chưa tới đích.
+ */
 export function outcomeText(o: TweakOutcome, kind: 'apply' | 'revert'): string {
-  if (o.errors.length > 0) return o.status === 'partial' ? tt('tweaks.result.partial') : tt('tweaks.result.failed');
+  if (o.errors.length > 0) {
+    const reached = o.status === (kind === 'apply' ? 'applied' : 'not_applied');
+    return o.status === 'partial' || reached ? tt('tweaks.result.partial') : tt('tweaks.result.failed');
+  }
   if (kind === 'apply' && o.status === 'partial') return tt('tweaks.result.partial');
   return tt('tweaks.result.ok');
 }

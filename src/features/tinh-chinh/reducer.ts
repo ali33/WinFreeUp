@@ -1,5 +1,5 @@
 import type { RestorePointStatus } from '../../api/types';
-import { defaultSelection, needsConfirm, pendingChanges, presetSelection, selectable } from './presets';
+import { checkable, defaultSelection, needsConfirm, pendingChanges, presetSelection } from './presets';
 import type { ReadResult, RunReport, TweakEvent, TweakLevel } from './types';
 
 /**
@@ -80,10 +80,12 @@ function startRun(s: TState, kind: RunKind, ids: string[]): TState {
 export function reducer(s: TState, a: TAction): TState {
   switch (a.type) {
     case 'LOAD_STARTED':
-      return s.data ? { ...s, reloading: true, loadError: null } : { ...s, phase: 'loading', loadError: null };
+      if (s.data) return { ...s, reloading: true, loadError: null };
+      // Đang xem kết quả mà dữ liệu đã bị dọn (đọc lại hỏng) ⇒ giữ phase done để không mất bảng kết quả.
+      return { ...s, phase: s.phase === 'done' ? 'done' : 'loading', loadError: null };
     case 'LOADED': {
       const tweaks = a.data.tweaks;
-      const allowed = new Set(tweaks.filter(selectable).map((t) => t.id));
+      const allowed = new Set(tweaks.filter(checkable).map((t) => t.id));
       const selected = s.touched ? s.selected.filter((id) => allowed.has(id)) : defaultSelection(tweaks);
       const phase = s.phase === 'loading' ? 'ready' : s.phase;
       return { ...s, phase, data: a.data, reloading: false, loadError: null, selected };
@@ -94,7 +96,7 @@ export function reducer(s: TState, a: TAction): TState {
     case 'TOGGLE': {
       if (s.phase !== 'ready' || !s.data) return s;
       const t = s.data.tweaks.find((x) => x.id === a.id);
-      if (!t || !selectable(t)) return s;
+      if (!t || !checkable(t)) return s;
       const selected = s.selected.includes(a.id) ? s.selected.filter((x) => x !== a.id) : [...s.selected, a.id];
       return { ...s, selected, touched: true };
     }
@@ -108,7 +110,10 @@ export function reducer(s: TState, a: TAction): TState {
       if (s.phase !== 'ready' || !s.data || s.reloading) return s;
       const ids = pendingChanges(s.data.tweaks, s.selected);
       if (ids.length === 0) return s;
-      return needsConfirm(s.data.tweaks, ids, s.allUsers).length > 0 ? { ...s, phase: 'confirm' } : { ...s, phase: 'restorePoint', restore: null };
+      // Chạy bằng tài khoản admin khác ⇒ luôn hỏi lại (mục theo tài khoản sẽ áp cho tài khoản admin đó).
+      // Cố ý chỉ hỏi cho Áp dụng: hoàn tác đưa máy về như cũ nên không hỏi (lệch có chủ ý, rà Task 11).
+      const ask = s.data.system.other_user || needsConfirm(s.data.tweaks, ids, s.allUsers).length > 0;
+      return ask ? { ...s, phase: 'confirm' } : { ...s, phase: 'restorePoint', restore: null };
     }
     case 'CONFIRM_ACCEPTED':
       return s.phase === 'confirm' ? { ...s, phase: 'restorePoint', restore: null } : s;
