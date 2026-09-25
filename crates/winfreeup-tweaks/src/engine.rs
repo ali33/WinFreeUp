@@ -223,7 +223,15 @@ enum Reverted {
 /// 3 gói) chỉ mở một lần; các thao tác sau vẫn giữ ảnh chụp.
 /// Không có ảnh chụp ⇒ chỉ trả `default` khi thao tác đang ở đích (`Match`); giá trị khác đích là
 /// của người dùng/công cụ khác, không đụng.
-fn revert_op(ops: &dyn TweakOps, snap: Option<&Snapshot>, op: &Op, store_seen: &mut BTreeSet<String>) -> Result<Reverted, String> {
+/// Máy do tổ chức quản lý + thao tác ghi vào nhánh chính sách (`\Policies\`): chỉ trả về ảnh chụp khi
+/// giá trị hiện tại vẫn đúng giá trị WinFreeUp đã ghi; tổ chức đã đổi, hoặc không có ảnh chụp (không có
+/// bằng chứng WinFreeUp đã ghi) ⇒ không đụng, giữ ảnh chụp.
+fn revert_op(ops: &dyn TweakOps, sys: &SystemInfo, snap: Option<&Snapshot>, op: &Op, store_seen: &mut BTreeSet<String>) -> Result<Reverted, String> {
+    if let Op::RegistrySet { path, name, value_type, value, .. } = op {
+        if sys.managed && is_policy_path(path) && (snap.is_none() || ops.reg_read(path, name)? != Some(to_reg_data(*value_type, value)?)) {
+            return Ok(Reverted::Nothing);
+        }
+    }
     if snap.is_none() && !matches!(op, Op::RegistryDelete { .. } | Op::AppxRemove { .. }) && op_state(ops, op, false)? != OpState::Match {
         return Ok(Reverted::Nothing);
     }
@@ -291,6 +299,11 @@ fn revert_op(ops: &dyn TweakOps, snap: Option<&Snapshot>, op: &Op, store_seen: &
     }
 }
 
+/// Cùng quy tắc với `state::is_policy_path` (bản đó private).
+fn is_policy_path(path: &str) -> bool {
+    path.to_ascii_lowercase().contains(r"\policies\")
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Apply { all_users: bool },
@@ -342,7 +355,7 @@ fn run(catalog: &[Tweak], ops: &dyn TweakOps, undo_path: &Path, ids: &[String], 
                         }
                         Mode::Revert => {
                             for (i, op) in t.ops.iter().enumerate().rev() {
-                                match revert_op(ops, undo.get(id, i), op, &mut store_seen) {
+                                match revert_op(ops, sys, undo.get(id, i), op, &mut store_seen) {
                                     Ok(Reverted::Done) => {
                                         changed = true;
                                         undo.remove(id, i);
@@ -914,11 +927,7 @@ ops = [
         assert!(!u.has_any("recall"));
     }
 
-    #[test]
-    fn managed_with_partial_snapshot_reverts_only_snapshotted_ops() {
-        let e = env();
-        let cat = parse_catalog(
-            r#"
+    const POL: &str = r#"
 [[tweak]]
 id = "pol"
 group = "privacy"
@@ -929,9 +938,45 @@ ops = [
   { kind = "registry_set", path = 'HKLM\SOFTWARE\Policies\P', name = "a", type = "dword", value = 1, default = "absent" },
   { kind = "registry_set", path = 'HKLM\SOFTWARE\Policies\P', name = "b", type = "dword", value = 1, default = "absent" },
 ]
-"#,
-        )
-        .unwrap();
+"#;
+
+    #[test]
+    fn managed_revert_keeps_snapshot_when_organization_changed_the_value() {
+        let e = env();
+        let cat = parse_catalog(POL).unwrap();
+        let (mut u, _) = UndoStore::load(&e.undo);
+        u.record_if_absent("pol", 0, Snapshot::Registry { data: None });
+        u.save().unwrap();
+        // #0 WinFreeUp từng ghi 1, sau đó tổ chức đổi thành 0; #1 của tổ chức, không ảnh chụp.
+        let mut f = FakeOps::default().with_reg(r"HKLM\SOFTWARE\Policies\P", "a", RegData::Dword(0)).with_reg(r"HKLM\SOFTWARE\Policies\P", "b", RegData::Dword(0));
+        f.sys.managed = true;
+        let r = revert(&cat, &f, &e.undo, &ids(&["pol"]), &quiet);
+        assert!(r.outcomes[0].errors.is_empty(), "{:?}", r.outcomes[0].errors);
+        assert_eq!(f.get(r"HKLM\SOFTWARE\Policies\P", "a"), Some(RegData::Dword(0)), "giá trị của tổ chức ⇒ không đụng");
+        assert!(f.calls().is_empty(), "{:?}", f.calls());
+        let (u, _) = UndoStore::load(&e.undo);
+        assert!(u.get("pol", 0).is_some(), "giữ ảnh chụp");
+    }
+
+    #[test]
+    fn managed_revert_without_snapshot_leaves_policy_values_even_at_target() {
+        for managed in [true, false] {
+            let e = env();
+            let cat = parse_catalog(POL).unwrap();
+            let mut f = FakeOps::default().with_reg(r"HKLM\SOFTWARE\Policies\P", "a", RegData::Dword(1)).with_reg(r"HKLM\SOFTWARE\Policies\P", "b", RegData::Dword(1));
+            f.sys.managed = managed;
+            let r = revert(&cat, &f, &e.undo, &ids(&["pol"]), &quiet);
+            assert!(r.outcomes[0].errors.is_empty(), "{:?}", r.outcomes[0].errors);
+            let want = if managed { Some(RegData::Dword(1)) } else { None };
+            assert_eq!(f.get(r"HKLM\SOFTWARE\Policies\P", "a"), want, "managed={managed}: không ảnh chụp ⇒ chỉ máy không managed mới trả default");
+            assert_eq!(f.get(r"HKLM\SOFTWARE\Policies\P", "b"), want, "managed={managed}");
+        }
+    }
+
+    #[test]
+    fn managed_with_partial_snapshot_reverts_only_snapshotted_ops() {
+        let e = env();
+        let cat = parse_catalog(POL).unwrap();
         // #0 WinFreeUp đã áp dụng (có ảnh chụp: vốn không có); #1 tổ chức đặt khác đích, không ảnh chụp.
         let (mut u, _) = UndoStore::load(&e.undo);
         u.record_if_absent("pol", 0, Snapshot::Registry { data: None });
