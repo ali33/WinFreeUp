@@ -74,6 +74,16 @@ export function friendly(e: unknown): string {
       return tk('km.err.aborted');
     case 'unknown_volume':
       return tk('km.err.unknownVolume');
+    case 'bad_path':
+      return tk('km.err.badPath');
+    case 'redirected_path':
+      return tk('km.err.redirectedPath');
+    case 'no_recycle_bin':
+      return tk('km.err.noRecycleBin');
+    case 'recycle_disabled':
+      return tk('km.err.recycleDisabled');
+    case 'onedrive':
+      return tk('km.err.onedrive');
     default:
       return m;
   }

@@ -26,6 +26,11 @@ describe('định dạng', () => {
     expect(friendly('unknown_node')).toContain('quét lại');
     expect(friendly(new Error('Access is denied. (os error 5)'))).toBe('Access is denied. (os error 5)');
     expect(friendly('unknown_volume')).toContain('bị rút ra');
+    expect(friendly('bad_path')).toContain('không hợp lệ');
+    expect(friendly('redirected_path')).toContain('liên kết');
+    expect(friendly('no_recycle_bin')).toContain('không có Thùng rác');
+    expect(friendly('recycle_disabled')).toContain('bị tắt');
+    expect(friendly('onedrive')).toContain('OneDrive');
   });
 
   it('lỗi không phải chuỗi/Error vẫn ra chữ, không ném', () => {
