@@ -177,6 +177,9 @@ async function runClean(d: Deps): Promise<void> {
     try {
       d.store.dispatch({ type: 'FREE_SPACE', bytes: await d.api.diskFree() });
     } catch (e) {
+      // freeBefore cũ (đo ở màn Chào) không còn đáng tin ⇒ null nó đi, đừng để màn Kết quả
+      // tính «Đã lấy lại» từ số cũ.
+      d.store.dispatch({ type: 'FREE_BEFORE_FAILED' });
       d.notify('warning', t('errors.freeSpaceFailed', { message: friendly(e) }));
     }
     let summary: CleanSummary;

@@ -56,6 +56,7 @@ export type Action =
   | { type: 'APP_INFO'; dryRun: boolean; systemDrive: string }
   | { type: 'FREE_SPACE'; bytes: number }
   | { type: 'FREE_SPACE_FAILED' }
+  | { type: 'FREE_BEFORE_FAILED' }
   | { type: 'SCAN_STARTED' }
   | { type: 'SCAN_GROUP_DONE'; group: GroupScan }
   | { type: 'SCAN_FINISHED'; groups: GroupScan[] }
@@ -126,6 +127,11 @@ export function reducer(s: State, a: Action): State {
       return { ...s, freeBefore: a.bytes, freeFailed: false };
     case 'FREE_SPACE_FAILED':
       return { ...s, freeFailed: true };
+    // Đo lại "trước" ngay khi bắt đầu dọn (runClean) mà lỗi: freeBefore cũ có thể đã lệch xa
+    // thực tế (đo từ màn Chào), không được giữ lại kẻo «Đã lấy lại» ở màn Kết quả tính ra số
+    // sai. Đặt về null để buộc hiện «Không đo được…».
+    case 'FREE_BEFORE_FAILED':
+      return { ...s, freeBefore: null, freeFailed: true };
     case 'SCAN_STARTED':
       if (s.phase !== 'welcome' && s.phase !== 'preview') return s;
       return { ...s, phase: 'scanning', groups: pendingGroups(), selected: [], cancelling: false };
@@ -179,7 +185,10 @@ export function reducer(s: State, a: Action): State {
       return { ...s, cleaning: applyCleanEvent(s.cleaning, a.event) };
     case 'CLEAN_DONE':
       if (s.phase !== 'cleaning') return s;
-      return { ...s, phase: 'result', summary: a.summary, freeAfter: null, freeAfterFailed: false };
+      // freeBefore đã null (do FREE_BEFORE_FAILED) thì «Đã lấy lại» không tính được dù đo "sau"
+      // có thành công hay không ⇒ đánh dấu freeAfterFailed ngay từ đây để màn Kết quả hiện
+      // «Không đo được…» thay vì kẹt mãi ở vòng quay (FREE_AFTER không tự xoá cờ này).
+      return { ...s, phase: 'result', summary: a.summary, freeAfter: null, freeAfterFailed: s.freeBefore === null };
     case 'CLEAN_FAILED':
       if (s.phase !== 'cleaning') return s;
       return { ...s, phase: 'preview', cleaning: [] };

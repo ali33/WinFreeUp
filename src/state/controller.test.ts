@@ -173,6 +173,27 @@ describe('dọn', () => {
     expect(store.getState().freeAfter).toBe(52 * GB);
   });
 
+  it('đo lại dung lượng trước khi dọn thất bại: freeBefore về null, vẫn dọn tiếp và báo hổ phách', async () => {
+    let call = 0;
+    const diskFree = vi.fn(async () => {
+      call++;
+      if (call === 1) return 50 * GB; // loadInitial
+      if (call === 2) return Promise.reject('device busy'); // đo lại "trước" ngay trước khi dọn
+      return 52 * GB; // đo "sau" khi dọn xong
+    });
+    const { d, store, api, notify } = setup({ diskFree });
+    await c.loadInitial(d);
+    await c.startScan(d);
+    expect(store.getState().freeBefore).toBe(50 * GB);
+    await c.requestClean(d);
+    expect(api.clean).toHaveBeenCalledTimes(1);
+    expect(store.getState().phase).toBe('result');
+    expect(store.getState().freeBefore).toBeNull();
+    expect(store.getState().freeFailed).toBe(true);
+    expect(store.getState().freeAfterFailed).toBe(true);
+    expect(notify).toHaveBeenCalledWith('warning', 'Không đọc được dung lượng ổ đĩa: device busy');
+  });
+
   it('có nhóm Cân nhắc: hỏi, đồng ý thì tạo điểm khôi phục rồi dọn', async () => {
     const { d, store, api } = setup();
     await c.startScan(d);
