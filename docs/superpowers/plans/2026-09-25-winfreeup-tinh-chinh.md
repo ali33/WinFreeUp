@@ -40,13 +40,14 @@ Giá trị chép nguyên văn từ spec; mọi task ngầm bao gồm mục này.
 4. **Chạy bằng tài khoản admin khác** (UAC nhập mật khẩu admin khác): phát hiện bằng `WTSQuerySessionInformationW` so với `GetUserNameW`, hiện băng hổ phách; không chặn. **Máy «do tổ chức quản lý»** = vào domain (`NetGetJoinInformation`) hoặc có key `Enrollments` với ProviderID `MS DM Server` — máy dev có 35 key Enrollments của chính Windows, không key nào là MDM thật.
 5. **Chạy thử `--dry-run`**: tab Tinh chỉnh chỉ xem; lệnh áp dụng/hoàn tác/khởi động lại Explorer trả lỗi `dry_run`, điểm khôi phục trả `skipped`.
 6. Tab «Dọn ổ đĩa» và «Tinh chỉnh» khoá lẫn nhau khi một bên đang chạy (hai thao tác cùng muốn tạo điểm khôi phục; Windows chỉ cho 1 điểm/24 giờ). `app.title` đổi thành «WinFreeUp» vì cửa sổ giờ có hai tab.
-7. Mục «Win 10» trong bảng gỡ app của spec **không** bị giới hạn `max_build` — máy nâng cấp lên Win 11 vẫn có thể còn 3D Viewer/Paint 3D; app không có trên máy thì tự ẩn.
-8. `task_appraiser` tắt cả hai tên tác vụ: `Microsoft Compatibility Appraiser` (Win 10/11 cũ) và `Microsoft Compatibility Appraiser Exp` (đo trên build 26200: chỉ còn tên này). Tác vụ không có trên máy được bỏ qua khi tính trạng thái.
+7. **Teams mới `MSTeams` nằm trong danh sách cấm gỡ** (dùng chung công việc + cá nhân). **Teams cá nhân cũ `MicrosoftTeams` tạm KHÔNG có trong danh mục** — Microsoft đã bỏ app này, không còn trang Store nên gỡ rồi không hoàn tác được; đang chờ người dùng chọn (mục «Câu hỏi còn mở» cuối kế hoạch).
+8. Mục «Win 10» trong bảng gỡ app của spec **không** bị giới hạn `max_build` — máy nâng cấp lên Win 11 vẫn có thể còn 3D Viewer/Paint 3D; app không có trên máy thì tự ẩn.
+9. `task_appraiser` tắt cả hai tên tác vụ: `Microsoft Compatibility Appraiser` (Win 10/11 cũ) và `Microsoft Compatibility Appraiser Exp` (đo trên build 26200: chỉ còn tên này). Tác vụ không có trên máy được bỏ qua khi tính trạng thái.
 
 ## Review Focus
 
 1. Người dùng thường chạy WinFreeUp và UAC hỏi mật khẩu **một tài khoản admin khác** ⇒ `HKCU` và danh sách app là của tài khoản admin, không phải của người đang ngồi máy. Người dùng phải thấy băng hổ phách nói rõ điều đó trước khi áp dụng, thay vì «áp dụng xong» mà máy mình không đổi gì. (Test: Task 6 `info::tests::reads_this_machine` khẳng định máy dev `other_user = false`; Task 11 `chạy bằng tài khoản admin khác ⇒ băng hổ phách cảnh báo`.)
-2. App **không có trên máy** và **sai build** (Teams cá nhân `min_build = 22000` trên Win 10, Widgets trên Win 10) ⇒ mục bị ẩn, không hiện dòng «Không hỗ trợ trên máy này» cho một app người dùng chưa từng thấy. (Test: Task 4 `absent_app_on_unsupported_build_is_hidden_not_unsupported`.)
+2. App **không có trên máy** và **sai build** (Widgets `min_build = 22000` trên Win 10) ⇒ mục bị ẩn, không hiện dòng «Không hỗ trợ trên máy này» cho một app người dùng chưa từng thấy. (Test: Task 4 `absent_app_on_unsupported_build_is_hidden_not_unsupported`.)
 3. Máy cá nhân có hàng chục key dưới `HKLM\SOFTWARE\Microsoft\Enrollments` (Local/Cloud/Deploy Authority — đo trên máy dev: 35 key) ⇒ **không** được coi là «do tổ chức quản lý»; coi sai thì mọi mục `\Policies\` mà công cụ khác từng đặt bị khoá. (Test: Task 6 `only_real_mdm_counts_as_managed`; Task 4 `managed_only_when_org_policy_already_differs`.)
 4. Không ghi được file hoàn tác (ổ đầy, thư mục `%LOCALAPPDATA%\WinFreeUp` bị chặn, file trùng tên thư mục) ⇒ thao tác **không được chạy** — thà không đổi gì còn hơn đổi mà không có đường quay lại. (Test: Task 5 `op_is_not_run_when_snapshot_cannot_be_saved`.)
 5. Value registry do công cụ khác ghi **sai kiểu** (chuỗi `"0"` thay vì DWORD) ⇒ áp dụng ghi đúng kiểu, hoàn tác trả lại **đúng chuỗi cũ** chứ không đổi sang `default` hay DWORD. (Test: Task 5 `value_of_unexpected_type_is_snapshotted_and_restored_as_is`.)
@@ -61,7 +62,7 @@ WinFreeUp/
 ├─ crates/winfreeup-tweaks/                  CRATE MỚI — chỉ phần Tinh chỉnh sở hữu
 │  ├─ Cargo.toml                             ĐỦ mọi phụ thuộc + bảng [workspace] tạm (Task 1; Task 12 xoá bảng đó)
 │  ├─ Cargo.lock                             lock riêng tạm thời (Task 1; Task 12 xoá — dùng lock gốc)
-│  ├─ catalog.toml                           danh mục v1: 20 mục quyền riêng tư + 29 mục gỡ app (Task 2)
+│  ├─ catalog.toml                           danh mục v1: 20 mục quyền riêng tư + 28 mục gỡ app (Task 2)
 │  └─ src/
 │     ├─ lib.rs                              khai báo SẴN mọi module (Task 1) — task sau không sửa
 │     ├─ model.rs                            Group, Level, Risk, Restart, StartType, RegType, RegValue, WindowsReq, Op, Tweak, parse_catalog, to_reg_data, default_data (Task 1)
@@ -78,7 +79,7 @@ WinFreeUp/
 │        ├─ services.rs, tasks.rs            khung (Task 1) → Task 7
 │        └─ appx.rs, real.rs                 khung (Task 1) → Task 8 (RealTweakOps)
 ├─ src/features/tinh-chinh/                  THƯ MỤC MỚI — chỉ phần Tinh chỉnh sở hữu
-│  ├─ catalog.vi.json                        tên + mô tả 49 mục (Task 2; Task 12 trộn vào src/i18n/vi.json rồi xoá)
+│  ├─ catalog.vi.json                        tên + mô tả 48 mục (Task 2; Task 12 trộn vào src/i18n/vi.json rồi xoá)
 │  ├─ vi.json                                chuỗi giao diện (Task 9; Task 12 trộn rồi xoá)
 │  ├─ strings.ts                             tt(), hasKey() đọc hai JSON trên (Task 9; Task 12 đổi thành re-export `t`)
 │  ├─ types.ts, testdata.ts                  kiểu khớp serde + dữ liệu mẫu cho test (Task 9)
@@ -808,8 +809,8 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - Produces:
   - `blocklist::{BLOCKED_PACKAGES, FORBIDDEN_REG_FRAGMENTS, FORBIDDEN_SERVICES}`, `package_name(family: &str) -> &str` (phần trước `_` cuối), `is_blocked_package(name_or_family: &str) -> bool` (không phân biệt hoa thường; mẫu có `*` cuối = tiền tố), `is_forbidden_reg_path(path: &str) -> bool`, `is_forbidden_service(name: &str) -> bool`.
   - `catalog::CATALOG_TOML: &str` (`include_str!("../catalog.toml")`), `builtin() -> Result<Vec<Tweak>, String>`, `name_key(id) -> String` (= `tweaks.item.<id>.name`), `desc_key(id) -> String` (= `tweaks.item.<id>.desc`), `validate(catalog: &[Tweak], has_key: &dyn Fn(&str) -> bool) -> Vec<String>` (rỗng = hợp lệ), `is_product_id(s: &str) -> bool`.
-  - `catalog.toml`: 49 mục — 20 `privacy`, 29 `bloatware`; `id` dùng ở giao diện (Task 9–11) và `testdata.ts`: `ads_id`, `svc_diagtrack`, `recall_off`, `cloud_clipboard`, `app_clipchamp`, `app_weather`, `app_game_bar`, `app_tiktok` (và các id còn lại trong file).
-  - `src/features/tinh-chinh/catalog.vi.json`: phẳng, khoá `tweaks.item.<id>.name` / `.desc` cho đủ 49 mục (Task 9 đọc; Task 12 trộn vào `src/i18n/vi.json`).
+  - `catalog.toml`: 48 mục — 20 `privacy`, 28 `bloatware`; `id` dùng ở giao diện (Task 9–11) và `testdata.ts`: `ads_id`, `svc_diagtrack`, `recall_off`, `cloud_clipboard`, `app_clipchamp`, `app_weather`, `app_game_bar`, `app_tiktok` (và các id còn lại trong file).
+  - `src/features/tinh-chinh/catalog.vi.json`: phẳng, khoá `tweaks.item.<id>.name` / `.desc` cho đủ 48 mục (Task 9 đọc; Task 12 trộn vào `src/i18n/vi.json`).
 
 Luật kiểm (spec mục 7 + Global Constraints): `id` duy nhất và `[a-z0-9_]+`; đủ chuỗi tên/mô tả; `min_build ≤ max_build` khi `max_build ≠ 0`; `editions` ∈ `* Home Pro Enterprise Education`; mục `bloatware` chỉ chứa `appx_remove` và ngược lại; value/default đúng kiểu (thiếu `default` ⇒ `parse_catalog` đã báo lỗi); đường dẫn bắt đầu `HKCU\`/`HKLM\` và không chạm Defender/Windows Update/SmartScreen/Firewall; dịch vụ không thuộc danh sách cấm đụng; `package_family` có dạng `Name_PublisherId`, không khớp danh sách cấm gỡ; `store_product_id` là ProductId hợp lệ (12 ký tự `A-Z0-9`, hoặc 14 ký tự bắt đầu `XP` — app Win32 trên Store).
 
@@ -831,6 +832,8 @@ mod tests {
         assert!(is_blocked_package("Microsoft.Paint_8wekyb3d8bbwe"));
         assert!(!is_blocked_package("Microsoft.MSPaint_8wekyb3d8bbwe"), "Paint 3D không phải Paint mới");
         assert!(!is_blocked_package("Clipchamp.Clipchamp_yxz26nhyzhsrt"));
+        assert!(is_blocked_package("MSTeams_8wekyb3d8bbwe"), "Teams công việc/mới không bao giờ bị gỡ");
+        assert!(!is_blocked_package("MicrosoftTeams_8wekyb3d8bbwe"), "Teams cá nhân cũ là gói khác");
         assert!(!is_blocked_package("Microsoft.WindowsStoreX_1"), "khớp đúng tên, không khớp tiền tố khi không có *");
     }
 
@@ -897,6 +900,8 @@ mod tests {
         let e = one(&format!("{HEAD}ops = [{{ kind = \"appx_remove\", package_family = \"Microsoft.WindowsStore_8wekyb3d8bbwe\", store_product_id = \"9WZDNCRFJBMP\" }}]"));
         assert!(e.iter().any(|m| m.contains("do-not-remove")), "{e:?}");
         let e = one(&format!("{HEAD}ops = [{{ kind = \"appx_remove\", package_family = \"Microsoft.VCLibs.140.00_8wekyb3d8bbwe\", store_product_id = \"9WZDNCRFJBMP\" }}]"));
+        assert!(e.iter().any(|m| m.contains("do-not-remove")), "{e:?}");
+        let e = one(&format!("{HEAD}ops = [{{ kind = \"appx_remove\", package_family = \"MSTeams_8wekyb3d8bbwe\", store_product_id = \"XP8BT8DW290MPQ\" }}]"));
         assert!(e.iter().any(|m| m.contains("do-not-remove")), "{e:?}");
     }
 
@@ -970,6 +975,8 @@ pub const BLOCKED_PACKAGES: &[&str] = &[
     "Microsoft.Windows.StartMenuExperienceHost",
     "Microsoft.Windows.ShellExperienceHost",
     "MicrosoftWindows.Client.CBS",
+    // Teams mới — dùng chung cho công việc và cá nhân. Chỉ Teams cá nhân cũ (`MicrosoftTeams`) mới được gỡ.
+    "MSTeams",
 ];
 
 /// Chuỗi con (không phân biệt hoa thường) mà đường dẫn registry của danh mục không được chứa.
@@ -1140,7 +1147,7 @@ Nguồn: bảng spec mục 4.1–4.2; giá trị `default` lấy theo giá trị
 # Danh mục Tinh chỉnh v1 — spec mục 4. Nhúng vào exe (include_str!). Mỗi mục cần chuỗi
 # `tweaks.item.<id>.name` và `.desc` trong file tiếng Việt; test `builtin_catalog_is_valid` chặn danh mục sai.
 # Bảng «Xác minh danh mục» trong kế hoạch ghi mục nào đã xác minh (máy thật / API Store), mục nào còn phải thử tay.
-# Teams cá nhân (MicrosoftTeams) không còn trang Store riêng — «Cài lại» mở trang Microsoft Teams hiện hành (XP8BT8DW290MPQ).
+# Không có «Teams cá nhân» (MicrosoftTeams): Microsoft đã bỏ app này, không còn trang Store để cài lại ⇒ không hoàn tác được — xem «Câu hỏi còn mở» trong kế hoạch.
 
 # ───────────── Quyền riêng tư & quảng cáo — Cơ bản ─────────────
 
@@ -1527,14 +1534,6 @@ windows = { min_build = 19041 }
 ops = [ { kind = "appx_remove", package_family = "Microsoft.MicrosoftSolitaireCollection_8wekyb3d8bbwe", store_product_id = "9WZDNCRFHWD2" } ]
 
 [[tweak]]
-id = "app_teams_personal"
-group = "bloatware"
-level = "recommended"
-risk = "safe"
-windows = { min_build = 22000 }
-ops = [ { kind = "appx_remove", package_family = "MicrosoftTeams_8wekyb3d8bbwe", store_product_id = "XP8BT8DW290MPQ" } ]
-
-[[tweak]]
 id = "app_copilot"
 group = "bloatware"
 level = "recommended"
@@ -1698,8 +1697,6 @@ ops = [ { kind = "appx_remove", package_family = "microsoft.windowscommunication
   "tweaks.item.app_maps.desc": "Ứng dụng Bản đồ Windows.",
   "tweaks.item.app_solitaire.name": "Solitaire Collection",
   "tweaks.item.app_solitaire.desc": "Trò chơi bài có quảng cáo.",
-  "tweaks.item.app_teams_personal.name": "Teams cá nhân",
-  "tweaks.item.app_teams_personal.desc": "Bản Teams dành cho cá nhân. Teams dùng cho công việc không bị gỡ.",
   "tweaks.item.app_copilot.name": "Copilot",
   "tweaks.item.app_copilot.desc": "Ứng dụng Microsoft Copilot.",
   "tweaks.item.app_widgets.name": "Widgets",
@@ -1733,7 +1730,7 @@ rtk git add crates/winfreeup-tweaks/src/blocklist.rs
 rtk git add crates/winfreeup-tweaks/src/catalog.rs
 rtk git add crates/winfreeup-tweaks/catalog.toml
 rtk git add src/features/tinh-chinh/catalog.vi.json
-rtk git commit -m "feat(tweaks): danh mục v1 (49 mục), danh sách cấm gỡ/cấm đụng, test chặn danh mục sai
+rtk git commit -m "feat(tweaks): danh mục v1 (48 mục), danh sách cấm gỡ/cấm đụng, test chặn danh mục sai
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -5890,7 +5887,7 @@ rtk git rm src/features/tinh-chinh/vi.json
 rtk git rm src/features/tinh-chinh/catalog.vi.json
 ```
 
-Expected: `đã thêm 162 khoá` (1 `tabs.clean` + 63 khoá giao diện + 98 khoá danh mục). Script dừng nếu có khoá trùng hoặc `app.title` đã bị nhánh khác đổi — khi đó sửa tay `app.title` thành `WinFreeUp` rồi bỏ dòng kiểm trong script.
+Expected: `đã thêm 160 khoá` (1 `tabs.clean` + 63 khoá giao diện + 96 khoá danh mục). Script dừng nếu có khoá trùng hoặc `app.title` đã bị nhánh khác đổi — khi đó sửa tay `app.title` thành `WinFreeUp` rồi bỏ dòng kiểm trong script.
 
 `src/features/tinh-chinh/strings.ts` — thay TOÀN BỘ nội dung bằng:
 
@@ -6456,7 +6453,6 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 | `app_weather` | Khuyến nghị | `Microsoft.BingWeather_8wekyb3d8bbwe` | `9WZDNCRFJ3Q2` | vắng — thử tay VM | «MSN Weather»; family khớp |
 | `app_maps` | Khuyến nghị | `Microsoft.WindowsMaps_8wekyb3d8bbwe` | `9WZDNCRDTBVB` | vắng — thử tay VM | «Windows Maps»; family khớp |
 | `app_solitaire` | Khuyến nghị | `Microsoft.MicrosoftSolitaireCollection_8wekyb3d8bbwe` | `9WZDNCRFHWD2` | vắng — thử tay VM | «Microsoft Solitaire Collection»; family khớp |
-| `app_teams_personal` | Khuyến nghị | `MicrosoftTeams_8wekyb3d8bbwe` | `XP8BT8DW290MPQ` | vắng — thử tay VM | «Microsoft Teams»; family KHÁC: MSTeams_8wekyb3d8bbwe!MSTeams |
 | `app_copilot` | Khuyến nghị | `Microsoft.Copilot_8wekyb3d8bbwe` | `9NHT9RB2F4HD` | **có** — family khớp | «Microsoft Copilot on Windows»; family khớp |
 | `app_widgets` | Khuyến nghị | `MicrosoftWindows.Client.WebExperience_cw5n1h2txyewy` | `9MSSGKG348SP` | **có** — family khớp | «Windows Web Experience Pack»; family khớp |
 | `app_family` | Khuyến nghị | `MicrosoftCorporationII.MicrosoftFamily_8wekyb3d8bbwe` | `9PDJDJS743XF` | vắng — thử tay VM | «Microsoft Family Safety»; family khớp |
@@ -6470,6 +6466,17 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 | `app_outlook_new` | Triệt để | `Microsoft.OutlookForWindows_8wekyb3d8bbwe` | `9NRX63209R7B` | **có** — family khớp | «Outlook for Windows»; family khớp |
 | `app_mail_calendar` | Triệt để | `microsoft.windowscommunicationsapps_8wekyb3d8bbwe` | `9WZDNCRFHVQM` | vắng — thử tay VM | «Mail and Calendar»; family khớp |
 
-Cột API Store: đo ngày 2026-09-25 bằng `GET https://storeedgefd.dsx.mp.microsoft.com/v9.0/products/<ProductId>?market=US&locale=en-us&deviceFamily=Windows.Desktop` (API công khai mà app Store dùng), so `Payload.Title` và `Payload.PackageFamilyNames`. Ba chỗ **KHÁC** là cố ý: Teams cá nhân (`MicrosoftTeams`) không còn trang Store riêng nên «Cài lại» mở trang Microsoft Teams hiện hành; hai gói phụ của Game Bar không có trang riêng, cài lại qua trang Game Bar. Khi viết kế hoạch, cách đo này đã bắt được **3 ProductId sai** (Candy Crush Soda Saga `9NBLGGH2S8Z3` và Friends Saga `9NBLGGH26TZT` trả 404; `9MSPC6MP8FM4` là Microsoft Whiteboard) — đã sửa trong danh mục trên. Phần còn phải thử tay: gỡ thật và «Cài lại từ Store» cho các gói «vắng» trên máy dev (bảng thử tay #11–#15).
+Cột API Store: đo ngày 2026-09-25 bằng `GET https://storeedgefd.dsx.mp.microsoft.com/v9.0/products/<ProductId>?market=US&locale=en-us&deviceFamily=Windows.Desktop` (API công khai mà app Store dùng), so `Payload.Title` và `Payload.PackageFamilyNames`. Hai chỗ **KHÁC** là hai gói phụ của Game Bar (`XboxGameOverlay`, `XboxSpeechToTextOverlay`) không có trang Store riêng; danh mục tạm cho «Cài lại» mở trang Game Bar — đang chờ người dùng chọn (mục «Câu hỏi còn mở») và phải thử tay xem cài lại Game Bar có đem hai gói này về không. People (`9NBLGGH10PG8`) API vẫn trả «Microsoft People» và family khớp, dù Microsoft đã ngừng app. Khi viết kế hoạch, cách đo này đã bắt được **3 ProductId sai** (Candy Crush Soda Saga `9NBLGGH2S8Z3` và Friends Saga `9NBLGGH26TZT` trả 404; `9MSPC6MP8FM4` là Microsoft Whiteboard — mục Teams cá nhân sau đó bị bỏ khỏi danh mục, xem «Câu hỏi còn mở») — hai ID Candy Crush đã sửa trong danh mục trên. Phần còn phải thử tay: gỡ thật và «Cài lại từ Store» cho các gói «vắng» trên máy dev (bảng thử tay #11–#15).
 
-Ghi chú: `MSTeams_8wekyb3d8bbwe` (Teams cho công việc) **có** trên máy dev — danh mục cố ý chỉ nhắm `MicrosoftTeams_8wekyb3d8bbwe` (Teams cá nhân), đúng spec. `Microsoft.Paint_8wekyb3d8bbwe` (Paint mới) có trên máy và nằm trong danh sách cấm; Paint 3D là `Microsoft.MSPaint`. `Microsoft.Edge.GameAssist` khớp mẫu `Microsoft.Edge*` của PowerShell nhưng **không** khớp mẫu cấm `Microsoft.MicrosoftEdge*` — không nằm trong danh mục nên không ảnh hưởng.
+Ghi chú: `MSTeams_8wekyb3d8bbwe` (Teams mới, dùng chung công việc và cá nhân) **có** trên máy dev và nằm trong `BLOCKED_PACKAGES` (test `exact_and_prefix_matching`, `blocked_package_in_catalog_is_rejected`). `MicrosoftTeams_8wekyb3d8bbwe` (Teams cá nhân cũ) vắng trên máy dev và hiện không có trong danh mục. `Microsoft.Paint_8wekyb3d8bbwe` (Paint mới) có trên máy và nằm trong danh sách cấm; Paint 3D là `Microsoft.MSPaint`. `Microsoft.Edge.GameAssist` khớp mẫu `Microsoft.Edge*` của PowerShell nhưng **không** khớp mẫu cấm `Microsoft.MicrosoftEdge*` — không nằm trong danh mục nên không ảnh hưởng.
+
+## Câu hỏi còn mở (chờ người dùng chọn — không chặn Đợt A–F)
+
+Spec bắt buộc «mọi `appx_remove` có `store_product_id`» và «mọi mục hoàn tác được từ trong app». Ba gói không có trang Store riêng (đã tra API Store, không bịa ID):
+
+| Gói | Tình trạng | Phương án A (khuyên dùng) | Phương án B | Phương án C |
+|---|---|---|---|---|
+| Teams cá nhân `MicrosoftTeams_8wekyb3d8bbwe` (Chat của Win 11 21H2/22H2) | Microsoft đã bỏ; trang Store duy nhất là Teams mới `MSTeams` — app khác, lại nằm trong danh sách cấm | **Bỏ khỏi danh mục** (kế hoạch đang theo phương án này) — không gỡ thứ không cài lại được | Giữ mục, hoàn tác mở trang Teams mới `XP8BT8DW290MPQ` và nói rõ «cài bản Teams mới thay thế» | Giữ mục, cho phép `store_product_id` rỗng; mục ghi «Không cài lại được» và luôn vào hộp xác nhận |
+| `Microsoft.XboxGameOverlay`, `Microsoft.XboxSpeechToTextOverlay` (gói phụ Game Bar, trong mục `app_game_bar`) | Không có trang riêng | **Giữ trong `app_game_bar`, «Cài lại» mở trang Game Bar `9NZKPSTSNW4P`** (kế hoạch đang theo phương án này); thử tay bước #15 xem cài lại Game Bar có đem hai gói về không | Bỏ hai gói phụ khỏi mục, chỉ gỡ `XboxGamingOverlay` (Win+G vẫn mất; hai gói phụ còn lại vô hại) | — |
+
+Chọn khác phương án A thì chỉ sửa `catalog.toml`, `catalog.vi.json` (Task 2) và bảng này; phương án C cho Teams thì thêm cả sửa luật `validate`.
