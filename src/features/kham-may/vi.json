@@ -11,6 +11,12 @@
   "km.err.aborted": "Bạn đã hủy thao tác xóa, không có gì bị xóa.",
   "km.err.unknownVolume": "Ổ đĩa này không còn — có thể đã bị rút ra. Hãy chọn lại ổ.",
   "km.err.logWrite": "Không ghi được nhật ký: {message}",
+  "km.err.badPath": "Đường dẫn này không hợp lệ — WinFreeUp không xóa mục này.",
+  "km.err.redirectedPath": "Mục này nằm sau một liên kết (junction/symlink) — WinFreeUp không xóa qua liên kết để tránh xóa nhầm chỗ khác.",
+  "km.err.noRecycleBin": "Ổ này không có Thùng rác (USB, ổ mạng…) — WinFreeUp chỉ xóa vào Thùng rác nên không xóa ở đây. Hãy xóa trong Explorer.",
+  "km.err.recycleDisabled": "Thùng rác của ổ này đang bị tắt — xóa sẽ mất hẳn nên WinFreeUp không xóa. Hãy xóa trong Explorer.",
+  "km.err.onedrive": "Mục này nằm trong OneDrive — xóa ở đây sẽ xóa luôn trên đám mây và mọi máy đồng bộ. Hãy xóa trong OneDrive hoặc Explorer.",
+  "km.common.retry": "Thử lại",
 
   "km.level.critical": "🔴 Nghiêm trọng",
   "km.level.warn": "🟠 Nên xử lý",
@@ -24,6 +30,8 @@
   "km.overview.allGood": "Không thấy vấn đề nào.",
   "km.overview.unknown": "Không đo được: {detail}",
   "km.overview.failed": "Không khám được: {message}",
+  "km.overview.someUnknown": "Có mục chưa đo được — xem lý do ở từng dòng.",
+  "km.overview.noResult": "Lõi không trả kết quả cho mục này.",
   "km.overview.throttleFailed": "Không đo được tốc độ CPU: {message}",
 
   "km.finding.disk_full.critical": "Ổ hệ thống gần đầy: chỉ còn {value}% trống. Windows có thể không cập nhật được và máy sẽ rất chậm.",
@@ -87,6 +95,7 @@
   "km.disk.rescan": "Quét lại",
   "km.disk.cancel": "Hủy",
   "km.disk.cancelling": "Đang hủy…",
+  "km.disk.cancelFailed": "Không hủy được: {message}",
   "km.disk.scanning": "Đang quét {root}…",
   "km.disk.progress": "{files} file · {size}",
   "km.disk.scanFailed": "Không quét được: {message}",
@@ -131,6 +140,7 @@
 
   "km.perf.starting": "Đang bắt đầu đo…",
   "km.perf.startFailed": "Không bắt đầu đo được: {message}",
+  "km.perf.iconFailed": "Không lấy được biểu tượng app: {message}",
   "km.perf.sampleFailed": "Lỗi khi lấy mẫu: {message}",
   "km.perf.chart.cpu": "CPU",
   "km.perf.chart.ram": "RAM",
