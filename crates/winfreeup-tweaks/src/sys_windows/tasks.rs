@@ -26,8 +26,11 @@ fn not_found(e: &windows::core::Error) -> bool {
     e.code() == ERROR_FILE_NOT_FOUND.to_hresult() || e.code() == ERROR_PATH_NOT_FOUND.to_hresult()
 }
 
-/// `\A\B\Tên` ⇒ (`\A\B`, `Tên`); `\Tên` ⇒ (`\`, `Tên`).
+/// `\A\B\Tên` ⇒ (`\A\B`, `Tên`); `\Tên` ⇒ (`\`, `Tên`). Đường phải bắt đầu bằng `\` (tính từ gốc).
 pub fn split_task_path(path: &str) -> Result<(String, String), String> {
+    if !path.starts_with('\\') {
+        return Err(format!("bad task path: {path}"));
+    }
     match path.rsplit_once('\\') {
         Some((folder, name)) if !name.is_empty() => Ok((if folder.is_empty() { "\\".into() } else { folder.into() }, name.into())),
         _ => Err(format!("bad task path: {path}")),
@@ -37,29 +40,29 @@ pub fn split_task_path(path: &str) -> Result<(String, String), String> {
 fn with_task<T>(path: &str, f: impl FnOnce(&IRegisteredTask) -> Result<T, String>) -> Result<Option<T>, String> {
     let (folder, name) = split_task_path(path)?;
     let _com = Com::init();
-    let svc: ITaskService = unsafe { CoCreateInstance(&TaskScheduler, None, CLSCTX_INPROC_SERVER) }.map_err(|e| format!("TaskScheduler: {}", e.message()))?;
+    let svc: ITaskService = unsafe { CoCreateInstance(&TaskScheduler, None, CLSCTX_INPROC_SERVER) }.map_err(|e| format!("TaskScheduler: {e}"))?;
     let empty = VARIANT::default();
-    unsafe { svc.Connect(&empty, &empty, &empty, &empty) }.map_err(|e| format!("TaskScheduler: {}", e.message()))?;
+    unsafe { svc.Connect(&empty, &empty, &empty, &empty) }.map_err(|e| format!("TaskScheduler: {e}"))?;
     let folder = match unsafe { svc.GetFolder(&BSTR::from(folder.as_str())) } {
         Ok(f) => f,
         Err(e) if not_found(&e) => return Ok(None),
-        Err(e) => return Err(format!("{path}: {}", e.message())),
+        Err(e) => return Err(format!("{path}: {e}")),
     };
     let task = match unsafe { folder.GetTask(&BSTR::from(name.as_str())) } {
         Ok(t) => t,
         Err(e) if not_found(&e) => return Ok(None),
-        Err(e) => return Err(format!("{path}: {}", e.message())),
+        Err(e) => return Err(format!("{path}: {e}")),
     };
     f(&task).map(Some)
 }
 
 /// `Ok(None)` = tác vụ không có trên máy.
 pub fn enabled(path: &str) -> Result<Option<bool>, String> {
-    with_task(path, |t| unsafe { t.Enabled() }.map(|b| b.as_bool()).map_err(|e| format!("{path}: {}", e.message())))
+    with_task(path, |t| unsafe { t.Enabled() }.map(|b| b.as_bool()).map_err(|e| format!("{path}: {e}")))
 }
 
 pub fn set_enabled(path: &str, on: bool) -> Result<(), String> {
-    match with_task(path, |t| unsafe { t.SetEnabled(VARIANT_BOOL::from(on)) }.map_err(|e| format!("{path}: {}", e.message())))? {
+    match with_task(path, |t| unsafe { t.SetEnabled(VARIANT_BOOL::from(on)) }.map_err(|e| format!("{path}: {e}")))? {
         Some(()) => Ok(()),
         None => Err(format!("{path}: task not found")),
     }
@@ -74,6 +77,8 @@ mod tests {
         assert_eq!(split_task_path(r"\Microsoft\Windows\A B\C").unwrap(), (r"\Microsoft\Windows\A B".into(), "C".into()));
         assert_eq!(split_task_path(r"\Top").unwrap(), (r"\".into(), "Top".into()));
         assert!(split_task_path(r"\Folder\").is_err());
+        assert!(split_task_path(r"Microsoft\Windows\X").is_err());
+        assert!(split_task_path("X").is_err());
     }
 
     #[test]

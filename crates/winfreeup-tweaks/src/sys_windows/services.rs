@@ -1,6 +1,6 @@
 //! Kiểu khởi động dịch vụ qua Service Control Manager. Hoàn tác KHÔNG tự khởi động dịch vụ (spec 3.1).
 use windows::core::{HSTRING, PCWSTR};
-use windows::Win32::Foundation::{ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_NOT_ACTIVE};
+use windows::Win32::Foundation::{ERROR_SERVICE_CANNOT_ACCEPT_CTRL, ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_NOT_ACTIVE};
 use windows::Win32::System::Services::{
     ChangeServiceConfigW, CloseServiceHandle, ControlService, OpenSCManagerW, OpenServiceW, QueryServiceConfigW, ENUM_SERVICE_TYPE,
     QUERY_SERVICE_CONFIGW, SC_HANDLE, SC_MANAGER_CONNECT, SERVICE_AUTO_START, SERVICE_CHANGE_CONFIG, SERVICE_CONTROL_STOP,
@@ -21,11 +21,11 @@ impl Drop for Handle {
 
 /// `Ok(None)` = dịch vụ không tồn tại.
 fn open(name: &str, access: u32) -> Result<Option<(Handle, Handle)>, String> {
-    let scm = Handle(unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }.map_err(|e| format!("OpenSCManager: {}", e.message()))?);
+    let scm = Handle(unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }.map_err(|e| format!("OpenSCManager: {e}"))?);
     match unsafe { OpenServiceW(scm.0, &HSTRING::from(name), access) } {
         Ok(h) => Ok(Some((scm, Handle(h)))),
         Err(e) if e.code() == ERROR_SERVICE_DOES_NOT_EXIST.to_hresult() => Ok(None),
-        Err(e) => Err(format!("{name}: {}", e.message())),
+        Err(e) => Err(format!("{name}: {e}")),
     }
 }
 
@@ -36,7 +36,7 @@ pub fn start_type(name: &str) -> Result<Option<StartType>, String> {
     // u64 để vùng đệm canh lề 8 byte cho QUERY_SERVICE_CONFIGW.
     let mut buf = vec![0u64; (needed as usize).div_ceil(8).max(1)];
     let cfg = buf.as_mut_ptr() as *mut QUERY_SERVICE_CONFIGW;
-    unsafe { QueryServiceConfigW(svc.0, Some(cfg), (buf.len() * 8) as u32, &mut needed) }.map_err(|e| format!("{name}: {}", e.message()))?;
+    unsafe { QueryServiceConfigW(svc.0, Some(cfg), (buf.len() * 8) as u32, &mut needed) }.map_err(|e| format!("{name}: {e}"))?;
     let st = unsafe { (*cfg).dwStartType };
     match st {
         SERVICE_AUTO_START => Ok(Some(StartType::Auto)),
@@ -68,17 +68,20 @@ pub fn set_start_type(name: &str, start: StartType) -> Result<(), String> {
             PCWSTR::null(),
         )
     }
-    .map_err(|e| format!("{name}: {}", e.message()))
+    .map_err(|e| format!("{name}: {e}"))
 }
 
-/// Dịch vụ vốn đã dừng hoặc không tồn tại ⇒ `Ok(())`. Không chờ dừng hẳn.
+/// Dịch vụ vốn đã dừng, đang dừng/khởi động dở hoặc không tồn tại ⇒ `Ok(())`. Không chờ dừng hẳn.
 pub fn stop(name: &str) -> Result<(), String> {
     let Some((_scm, svc)) = open(name, SERVICE_STOP)? else { return Ok(()) };
     let mut status = SERVICE_STATUS::default();
     match unsafe { ControlService(svc.0, SERVICE_CONTROL_STOP, &mut status) } {
         Ok(()) => Ok(()),
         Err(e) if e.code() == ERROR_SERVICE_NOT_ACTIVE.to_hresult() => Ok(()),
-        Err(e) => Err(format!("{name}: {}", e.message())),
+        // Dịch vụ đang dừng/khởi động dở nên chưa nhận lệnh: đúng ngữ nghĩa "không chờ dừng hẳn",
+        // kiểu khởi động đã đổi thì lần khởi động sau sẽ theo. ERROR_DEPENDENT_SERVICES_RUNNING vẫn là lỗi.
+        Err(e) if e.code() == ERROR_SERVICE_CANNOT_ACCEPT_CTRL.to_hresult() => Ok(()),
+        Err(e) => Err(format!("{name}: {e}")),
     }
 }
 
