@@ -1,0 +1,469 @@
+# Danh mục Tinh chỉnh v1 — spec mục 4. Nhúng vào exe (include_str!). Mỗi mục cần chuỗi
+# `tweaks.item.<id>.name` và `.desc` trong file tiếng Việt; test `builtin_catalog_is_valid` chặn danh mục sai.
+# Bảng «Xác minh danh mục» trong kế hoạch ghi mục nào đã xác minh (máy thật / API Store), mục nào còn phải thử tay.
+# Không có «Teams cá nhân» (MicrosoftTeams): Microsoft đã bỏ app này, không còn trang Store để cài lại ⇒ không hoàn tác được — xem «Câu hỏi còn mở» trong kế hoạch.
+
+# ───────────── Quyền riêng tư & quảng cáo — Cơ bản ─────────────
+
+[[tweak]]
+id = "ads_id"
+group = "privacy"
+level = "basic"
+risk = "safe"
+windows = { min_build = 19041 }
+ops = [
+  { kind = "registry_set", path = 'HKCU\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo', name = "Enabled", type = "dword", value = 0, default = 1 },
+]
+
+[[tweak]]
+id = "ads_start_suggestions"
+group = "privacy"
+level = "basic"
+risk = "safe"
+windows = { min_build = 19041 }
+ops = [
+  { kind = "registry_set", path = 'HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager', name = "SystemPaneSuggestionsEnabled", type = "dword", value = 0, default = 1 },
+  { kind = "registry_set", path = 'HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager', name = "SubscribedContent-338388Enabled", type = "dword", value = 0, default = "absent" },
+  { kind = "registry_set", path = 'HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager', name = "SubscribedContent-338389Enabled", type = "dword", value = 0, default = 1 },
+  { kind = "registry_set", path = 'HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager', name = "SubscribedContent-338387Enabled", type = "dword", value = 0, default = "absent" },
+  { kind = "registry_set", path = 'HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager', name = "SubscribedContent-353694Enabled", type = "dword", value = 0, default = "absent" },
+  { kind = "registry_set", path = 'HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager', name = "SubscribedContent-353696Enabled", type = "dword", value = 0, default = "absent" },
+  { kind = "registry_set", path = 'HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager', name = "RotatingLockScreenOverlayEnabled", type = "dword", value = 0, default = 1 },
+  { kind = "registry_set", path = 'HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager', name = "SilentInstalledAppsEnabled", type = "dword", value = 0, default = 1 },
+]
+
+[[tweak]]
+id = "ads_explorer"
+group = "privacy"
+level = "basic"
+risk = "safe"
+windows = { min_build = 19041 }
+needs_restart = "explorer"
+ops = [
+  { kind = "registry_set", path = 'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced', name = "ShowSyncProviderNotifications", type = "dword", value = 0, default = "absent" },
+]
+
+[[tweak]]
+id = "tailored_experiences"
+group = "privacy"
+level = "basic"
+risk = "safe"
+windows = { min_build = 19041 }
+ops = [
+  { kind = "registry_set", path = 'HKCU\Software\Microsoft\Windows\CurrentVersion\Privacy', name = "TailoredExperiencesWithDiagnosticDataEnabled", type = "dword", value = 0, default = 1 },
+]
+
+[[tweak]]
+id = "scoobe"
+group = "privacy"
+level = "basic"
+risk = "safe"
+windows = { min_build = 19041 }
+ops = [
+  { kind = "registry_set", path = 'HKCU\Software\Microsoft\Windows\CurrentVersion\UserProfileEngagement', name = "ScoobeSystemSettingEnabled", type = "dword", value = 0, default = "absent" },
+]
+
+# ───────────── Quyền riêng tư & quảng cáo — Khuyến nghị ─────────────
+
+[[tweak]]
+id = "telemetry_min_security"
+group = "privacy"
+level = "recommended"
+risk = "safe"
+windows = { min_build = 19041, editions = ["Enterprise", "Education"] }
+ops = [
+  { kind = "registry_set", path = 'HKLM\SOFTWARE\Policies\Microsoft\Windows\DataCollection', name = "AllowTelemetry", type = "dword", value = 0, default = "absent" },
+]
+
+[[tweak]]
+id = "telemetry_min_required"
+group = "privacy"
+level = "recommended"
+risk = "safe"
+windows = { min_build = 19041, editions = ["Home", "Pro"] }
+ops = [
+  { kind = "registry_set", path = 'HKLM\SOFTWARE\Policies\Microsoft\Windows\DataCollection', name = "AllowTelemetry", type = "dword", value = 1, default = "absent" },
+]
+
+[[tweak]]
+id = "svc_diagtrack"
+group = "privacy"
+level = "recommended"
+risk = "caution"
+windows = { min_build = 19041 }
+ops = [
+  { kind = "service_startup", service = "DiagTrack", start = "disabled", default = "auto" },
+]
+
+[[tweak]]
+id = "search_no_bing"
+group = "privacy"
+level = "recommended"
+risk = "safe"
+windows = { min_build = 19041 }
+needs_restart = "explorer"
+ops = [
+  { kind = "registry_set", path = 'HKCU\Software\Policies\Microsoft\Windows\Explorer', name = "DisableSearchBoxSuggestions", type = "dword", value = 1, default = "absent" },
+]
+
+[[tweak]]
+id = "widgets_feed_win11"
+group = "privacy"
+level = "recommended"
+risk = "safe"
+windows = { min_build = 22000 }
+needs_restart = "explorer"
+ops = [
+  { kind = "registry_set", path = 'HKLM\SOFTWARE\Policies\Microsoft\Dsh', name = "AllowNewsAndInterests", type = "dword", value = 0, default = "absent" },
+]
+
+[[tweak]]
+id = "widgets_feed_win10"
+group = "privacy"
+level = "recommended"
+risk = "safe"
+windows = { min_build = 19041, max_build = 19045 }
+needs_restart = "explorer"
+ops = [
+  { kind = "registry_set", path = 'HKLM\SOFTWARE\Policies\Microsoft\Windows\Windows Feeds', name = "EnableFeeds", type = "dword", value = 0, default = "absent" },
+]
+
+[[tweak]]
+id = "activity_history"
+group = "privacy"
+level = "recommended"
+risk = "safe"
+windows = { min_build = 19041 }
+ops = [
+  { kind = "registry_set", path = 'HKLM\SOFTWARE\Policies\Microsoft\Windows\System', name = "PublishUserActivities", type = "dword", value = 0, default = "absent" },
+  { kind = "registry_set", path = 'HKLM\SOFTWARE\Policies\Microsoft\Windows\System', name = "UploadUserActivities", type = "dword", value = 0, default = "absent" },
+]
+
+[[tweak]]
+id = "inking_typing"
+group = "privacy"
+level = "recommended"
+risk = "safe"
+windows = { min_build = 19041 }
+ops = [
+  { kind = "registry_set", path = 'HKCU\Software\Microsoft\Input\TIPC', name = "Enabled", type = "dword", value = 0, default = 1 },
+  { kind = "registry_set", path = 'HKCU\Software\Microsoft\InputPersonalization', name = "RestrictImplicitInkCollection", type = "dword", value = 1, default = 0 },
+  { kind = "registry_set", path = 'HKCU\Software\Microsoft\InputPersonalization', name = "RestrictImplicitTextCollection", type = "dword", value = 1, default = 0 },
+]
+
+[[tweak]]
+id = "ceip_tasks"
+group = "privacy"
+level = "recommended"
+risk = "safe"
+windows = { min_build = 19041 }
+ops = [
+  { kind = "scheduled_task_disable", task = '\Microsoft\Windows\Customer Experience Improvement Program\Consolidator' },
+  { kind = "scheduled_task_disable", task = '\Microsoft\Windows\Customer Experience Improvement Program\UsbCeip' },
+]
+
+[[tweak]]
+id = "do_lan_only"
+group = "privacy"
+level = "recommended"
+risk = "safe"
+windows = { min_build = 19041 }
+ops = [
+  { kind = "registry_set", path = 'HKLM\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization', name = "DODownloadMode", type = "dword", value = 1, default = "absent" },
+]
+
+[[tweak]]
+id = "recall_off"
+group = "privacy"
+level = "recommended"
+risk = "safe"
+windows = { min_build = 26100 }
+needs_restart = "reboot"
+ops = [
+  { kind = "registry_set", path = 'HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsAI', name = "DisableAIDataAnalysis", type = "dword", value = 1, default = "absent" },
+]
+
+# ───────────── Quyền riêng tư & quảng cáo — Triệt để ─────────────
+
+[[tweak]]
+id = "task_appraiser"
+group = "privacy"
+level = "aggressive"
+risk = "caution"
+windows = { min_build = 19041 }
+ops = [
+  { kind = "scheduled_task_disable", task = '\Microsoft\Windows\Application Experience\Microsoft Compatibility Appraiser' },
+  { kind = "scheduled_task_disable", task = '\Microsoft\Windows\Application Experience\Microsoft Compatibility Appraiser Exp' },
+]
+
+[[tweak]]
+id = "svc_dmwappush"
+group = "privacy"
+level = "aggressive"
+risk = "caution"
+windows = { min_build = 19041 }
+ops = [
+  { kind = "service_startup", service = "dmwappushservice", start = "disabled", default = "manual" },
+]
+
+[[tweak]]
+id = "cloud_clipboard"
+group = "privacy"
+level = "aggressive"
+risk = "safe"
+windows = { min_build = 19041 }
+ops = [
+  { kind = "registry_set", path = 'HKLM\SOFTWARE\Policies\Microsoft\Windows\System', name = "AllowCrossDeviceClipboard", type = "dword", value = 0, default = "absent" },
+]
+
+[[tweak]]
+id = "settings_sync"
+group = "privacy"
+level = "aggressive"
+risk = "safe"
+windows = { min_build = 19041 }
+ops = [
+  { kind = "registry_set", path = 'HKLM\SOFTWARE\Policies\Microsoft\Windows\SettingSync', name = "DisableSettingSync", type = "dword", value = 2, default = "absent" },
+  { kind = "registry_set", path = 'HKLM\SOFTWARE\Policies\Microsoft\Windows\SettingSync', name = "DisableSettingSyncUserOverride", type = "dword", value = 1, default = "absent" },
+]
+
+# ───────────── Gỡ app — Cơ bản ─────────────
+
+[[tweak]]
+id = "app_candy_crush"
+group = "bloatware"
+level = "basic"
+risk = "safe"
+windows = { min_build = 19041 }
+ops = [
+  { kind = "appx_remove", package_family = "king.com.CandyCrushSaga_kgqvnymyfvs32", store_product_id = "9NBLGGH18846" },
+  { kind = "appx_remove", package_family = "king.com.CandyCrushSodaSaga_kgqvnymyfvs32", store_product_id = "9NBLGGH1ZRPV" },
+  { kind = "appx_remove", package_family = "king.com.CandyCrushFriends_kgqvnymyfvs32", store_product_id = "9PL3B0VQLQQ8" },
+]
+
+[[tweak]]
+id = "app_tiktok"
+group = "bloatware"
+level = "basic"
+risk = "safe"
+windows = { min_build = 19041 }
+ops = [ { kind = "appx_remove", package_family = "BytedancePte.Ltd.TikTok_6yccndn6064se", store_product_id = "9NH2GPH4JZS4" } ]
+
+[[tweak]]
+id = "app_instagram"
+group = "bloatware"
+level = "basic"
+risk = "safe"
+windows = { min_build = 19041 }
+ops = [ { kind = "appx_remove", package_family = "Facebook.InstagramBeta_8xx8rvfyw5nnt", store_product_id = "9NBLGGH5L9XT" } ]
+
+[[tweak]]
+id = "app_disney"
+group = "bloatware"
+level = "basic"
+risk = "safe"
+windows = { min_build = 19041 }
+ops = [ { kind = "appx_remove", package_family = "Disney.37853FC22B2CE_6rarf9sa4v8jt", store_product_id = "9NXQXXLFST89" } ]
+
+[[tweak]]
+id = "app_spotify"
+group = "bloatware"
+level = "basic"
+risk = "safe"
+windows = { min_build = 19041 }
+ops = [ { kind = "appx_remove", package_family = "SpotifyAB.SpotifyMusic_zpdnekdrzrea0", store_product_id = "9NCBCSZSJRSB" } ]
+
+[[tweak]]
+id = "app_tips"
+group = "bloatware"
+level = "basic"
+risk = "safe"
+windows = { min_build = 19041 }
+ops = [ { kind = "appx_remove", package_family = "Microsoft.Getstarted_8wekyb3d8bbwe", store_product_id = "9WZDNCRDTBJJ" } ]
+
+[[tweak]]
+id = "app_feedback_hub"
+group = "bloatware"
+level = "basic"
+risk = "safe"
+windows = { min_build = 19041 }
+ops = [ { kind = "appx_remove", package_family = "Microsoft.WindowsFeedbackHub_8wekyb3d8bbwe", store_product_id = "9NBLGGH4R32N" } ]
+
+[[tweak]]
+id = "app_news"
+group = "bloatware"
+level = "basic"
+risk = "safe"
+windows = { min_build = 19041 }
+ops = [ { kind = "appx_remove", package_family = "Microsoft.BingNews_8wekyb3d8bbwe", store_product_id = "9WZDNCRFHVFW" } ]
+
+[[tweak]]
+id = "app_office_hub"
+group = "bloatware"
+level = "basic"
+risk = "safe"
+windows = { min_build = 19041 }
+ops = [ { kind = "appx_remove", package_family = "Microsoft.MicrosoftOfficeHub_8wekyb3d8bbwe", store_product_id = "9WZDNCRD29V9" } ]
+
+[[tweak]]
+id = "app_clipchamp"
+group = "bloatware"
+level = "basic"
+risk = "safe"
+windows = { min_build = 19041 }
+ops = [ { kind = "appx_remove", package_family = "Clipchamp.Clipchamp_yxz26nhyzhsrt", store_product_id = "9P1J8S7CCWWT" } ]
+
+[[tweak]]
+id = "app_power_automate"
+group = "bloatware"
+level = "basic"
+risk = "safe"
+windows = { min_build = 19041 }
+ops = [ { kind = "appx_remove", package_family = "Microsoft.PowerAutomateDesktop_8wekyb3d8bbwe", store_product_id = "9NFTCH6J7FHV" } ]
+
+[[tweak]]
+id = "app_mixed_reality"
+group = "bloatware"
+level = "basic"
+risk = "safe"
+windows = { min_build = 19041 }
+ops = [ { kind = "appx_remove", package_family = "Microsoft.MixedReality.Portal_8wekyb3d8bbwe", store_product_id = "9NG1H8B3ZC7M" } ]
+
+[[tweak]]
+id = "app_3d_viewer"
+group = "bloatware"
+level = "basic"
+risk = "safe"
+windows = { min_build = 19041 }
+ops = [ { kind = "appx_remove", package_family = "Microsoft.Microsoft3DViewer_8wekyb3d8bbwe", store_product_id = "9NBLGGH42THS" } ]
+
+[[tweak]]
+id = "app_paint_3d"
+group = "bloatware"
+level = "basic"
+risk = "safe"
+windows = { min_build = 19041 }
+ops = [ { kind = "appx_remove", package_family = "Microsoft.MSPaint_8wekyb3d8bbwe", store_product_id = "9NBLGGH5FV99" } ]
+
+[[tweak]]
+id = "app_skype"
+group = "bloatware"
+level = "basic"
+risk = "safe"
+windows = { min_build = 19041 }
+ops = [ { kind = "appx_remove", package_family = "Microsoft.SkypeApp_kzf8qxf38zg5c", store_product_id = "9WZDNCRFJ364" } ]
+
+[[tweak]]
+id = "app_people"
+group = "bloatware"
+level = "basic"
+risk = "safe"
+windows = { min_build = 19041 }
+ops = [ { kind = "appx_remove", package_family = "Microsoft.People_8wekyb3d8bbwe", store_product_id = "9NBLGGH10PG8" } ]
+
+# ───────────── Gỡ app — Khuyến nghị ─────────────
+
+[[tweak]]
+id = "app_weather"
+group = "bloatware"
+level = "recommended"
+risk = "safe"
+windows = { min_build = 19041 }
+ops = [ { kind = "appx_remove", package_family = "Microsoft.BingWeather_8wekyb3d8bbwe", store_product_id = "9WZDNCRFJ3Q2" } ]
+
+[[tweak]]
+id = "app_maps"
+group = "bloatware"
+level = "recommended"
+risk = "safe"
+windows = { min_build = 19041 }
+ops = [ { kind = "appx_remove", package_family = "Microsoft.WindowsMaps_8wekyb3d8bbwe", store_product_id = "9WZDNCRDTBVB" } ]
+
+[[tweak]]
+id = "app_solitaire"
+group = "bloatware"
+level = "recommended"
+risk = "safe"
+windows = { min_build = 19041 }
+ops = [ { kind = "appx_remove", package_family = "Microsoft.MicrosoftSolitaireCollection_8wekyb3d8bbwe", store_product_id = "9WZDNCRFHWD2" } ]
+
+[[tweak]]
+id = "app_copilot"
+group = "bloatware"
+level = "recommended"
+risk = "safe"
+windows = { min_build = 19041 }
+ops = [ { kind = "appx_remove", package_family = "Microsoft.Copilot_8wekyb3d8bbwe", store_product_id = "9NHT9RB2F4HD" } ]
+
+[[tweak]]
+id = "app_widgets"
+group = "bloatware"
+level = "recommended"
+risk = "safe"
+windows = { min_build = 22000 }
+ops = [ { kind = "appx_remove", package_family = "MicrosoftWindows.Client.WebExperience_cw5n1h2txyewy", store_product_id = "9MSSGKG348SP" } ]
+
+[[tweak]]
+id = "app_family"
+group = "bloatware"
+level = "recommended"
+risk = "safe"
+windows = { min_build = 19041 }
+ops = [ { kind = "appx_remove", package_family = "MicrosoftCorporationII.MicrosoftFamily_8wekyb3d8bbwe", store_product_id = "9PDJDJS743XF" } ]
+
+[[tweak]]
+id = "app_cortana"
+group = "bloatware"
+level = "recommended"
+risk = "safe"
+windows = { min_build = 19041 }
+ops = [ { kind = "appx_remove", package_family = "Microsoft.549981C3F5F10_8wekyb3d8bbwe", store_product_id = "9NFFX4SZZ23L" } ]
+
+# ───────────── Gỡ app — Triệt để ─────────────
+
+[[tweak]]
+id = "app_xbox"
+group = "bloatware"
+level = "aggressive"
+risk = "safe"
+windows = { min_build = 19041 }
+ops = [
+  { kind = "appx_remove", package_family = "Microsoft.GamingApp_8wekyb3d8bbwe", store_product_id = "9MV0B5HZVK9Z" },
+  { kind = "appx_remove", package_family = "Microsoft.XboxApp_8wekyb3d8bbwe", store_product_id = "9WZDNCRFJBD8" },
+]
+
+[[tweak]]
+id = "app_game_bar"
+group = "bloatware"
+level = "aggressive"
+risk = "caution"
+windows = { min_build = 19041 }
+ops = [
+  { kind = "appx_remove", package_family = "Microsoft.XboxGamingOverlay_8wekyb3d8bbwe", store_product_id = "9NZKPSTSNW4P" },
+  { kind = "appx_remove", package_family = "Microsoft.XboxGameOverlay_8wekyb3d8bbwe", store_product_id = "9NZKPSTSNW4P" },
+  { kind = "appx_remove", package_family = "Microsoft.XboxSpeechToTextOverlay_8wekyb3d8bbwe", store_product_id = "9NZKPSTSNW4P" },
+]
+
+[[tweak]]
+id = "app_phone_link"
+group = "bloatware"
+level = "aggressive"
+risk = "safe"
+windows = { min_build = 19041 }
+ops = [ { kind = "appx_remove", package_family = "Microsoft.YourPhone_8wekyb3d8bbwe", store_product_id = "9NMPJ99VJBWV" } ]
+
+[[tweak]]
+id = "app_outlook_new"
+group = "bloatware"
+level = "aggressive"
+risk = "safe"
+windows = { min_build = 19041 }
+ops = [ { kind = "appx_remove", package_family = "Microsoft.OutlookForWindows_8wekyb3d8bbwe", store_product_id = "9NRX63209R7B" } ]
+
+[[tweak]]
+id = "app_mail_calendar"
+group = "bloatware"
+level = "aggressive"
+risk = "safe"
+windows = { min_build = 19041 }
+ops = [ { kind = "appx_remove", package_family = "microsoft.windowscommunicationsapps_8wekyb3d8bbwe", store_product_id = "9WZDNCRFHVQM" } ]
