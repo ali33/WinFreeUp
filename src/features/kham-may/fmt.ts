@@ -56,7 +56,8 @@ export function formatClock(ms: number): string {
  * chụp màn hình gửi lại được.
  */
 export function friendly(e: unknown): string {
-  const m = e instanceof Error ? e.message : typeof e === 'string' ? e : JSON.stringify(e);
+  const m = e instanceof Error ? e.message : typeof e === 'string' ? e : stringify(e);
+  // KHÔNG thêm/đổi nhánh cho mã 'cancelled': Task 12 so sánh nguyên chuỗi này để biết người dùng tự hủy.
   switch (m) {
     case 'busy':
       return tk('km.err.busy');
@@ -71,7 +72,20 @@ export function friendly(e: unknown): string {
       return tk('km.err.unknownApp');
     case 'aborted':
       return tk('km.err.aborted');
+    case 'unknown_volume':
+      return tk('km.err.unknownVolume');
     default:
       return m;
   }
+}
+
+/** JSON khi được; `undefined`, vòng tham chiếu, BigInt… thì `String(e)` — không bao giờ ném. */
+function stringify(e: unknown): string {
+  try {
+    const s = JSON.stringify(e);
+    if (typeof s === 'string') return s;
+  } catch {
+    // rơi xuống String(e)
+  }
+  return String(e);
 }

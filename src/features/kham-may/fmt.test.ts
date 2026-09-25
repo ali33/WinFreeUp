@@ -25,5 +25,14 @@ describe('định dạng', () => {
     expect(friendly('essential')).toContain('thiết yếu');
     expect(friendly('unknown_node')).toContain('quét lại');
     expect(friendly(new Error('Access is denied. (os error 5)'))).toBe('Access is denied. (os error 5)');
+    expect(friendly('unknown_volume')).toContain('bị rút ra');
+  });
+
+  it('lỗi không phải chuỗi/Error vẫn ra chữ, không ném', () => {
+    expect(friendly(undefined)).toBe('undefined');
+    const loop: Record<string, unknown> = { a: 1 };
+    loop.self = loop;
+    expect(friendly(loop)).toBe('[object Object]');
+    expect(friendly({ code: 5 })).toBe('{"code":5}');
   });
 });

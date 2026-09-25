@@ -9,6 +9,7 @@
   "km.err.staleTree": "Cây thư mục đã cũ, hãy quét lại.",
   "km.err.unknownApp": "App này đã thoát.",
   "km.err.aborted": "Bạn đã hủy thao tác xóa, không có gì bị xóa.",
+  "km.err.unknownVolume": "Ổ đĩa này không còn — có thể đã bị rút ra. Hãy chọn lại ổ.",
   "km.err.logWrite": "Không ghi được nhật ký: {message}",
 
   "km.level.critical": "🔴 Nghiêm trọng",
