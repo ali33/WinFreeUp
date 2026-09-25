@@ -1,0 +1,248 @@
+/* Tab Khám máy — mọi lớp có tiền tố km- để không đụng styles.css của v0.1. */
+
+.km-root {
+  display: grid;
+  gap: 16px;
+}
+
+.km-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.km-muted {
+  opacity: 0.75;
+  font-size: 13px;
+}
+
+.km-num {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  text-align: right;
+}
+
+.km-busy {
+  display: inline-flex;
+  align-items: center;
+}
+
+/* Tải lại một phần: giữ nội dung cũ mờ bên dưới lớp phủ, không xoá trắng. */
+.km-overlay-host {
+  position: relative;
+}
+
+.km-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 24px;
+  background: color-mix(in srgb, Canvas 55%, transparent);
+  z-index: 1;
+}
+
+/* ---- Tổng quan ---- */
+.km-findings {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.km-finding {
+  display: grid;
+  grid-template-columns: 150px 1fr auto;
+  align-items: center;
+  gap: 8px 12px;
+  padding: 10px 12px;
+  border-radius: 6px;
+  border: 1px solid color-mix(in srgb, currentColor 14%, transparent);
+}
+
+.km-finding-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: flex-end;
+}
+
+.km-startup {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.km-startup-item {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  gap: 2px 12px;
+}
+
+.km-startup-cmd {
+  grid-column: 2;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---- Ổ đĩa ---- */
+.km-tree {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.km-tree th,
+.km-tree td {
+  padding: 3px 6px;
+  text-align: left;
+}
+
+.km-tree th {
+  font-weight: 600;
+  border-bottom: 1px solid color-mix(in srgb, currentColor 20%, transparent);
+}
+
+.km-tree tr:hover td {
+  background: color-mix(in srgb, currentColor 6%, transparent);
+}
+
+.km-tree-name {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.km-tree-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.km-share {
+  width: 120px;
+}
+
+.km-share-bar {
+  height: 8px;
+  border-radius: 4px;
+  background: color-mix(in srgb, currentColor 12%, transparent);
+  overflow: hidden;
+}
+
+.km-share-fill {
+  height: 100%;
+  background: #0f6cbd;
+}
+
+.km-row-actions {
+  display: flex;
+  gap: 2px;
+  justify-content: flex-end;
+}
+
+/* ---- Bộ nhớ & Hiệu năng ---- */
+.km-charts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 12px;
+}
+
+.km-chart {
+  display: grid;
+  gap: 4px;
+}
+
+.km-chart-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.km-chart svg {
+  width: 100%;
+  height: 90px;
+  display: block;
+  border: 1px solid color-mix(in srgb, currentColor 14%, transparent);
+  border-radius: 4px;
+}
+
+.km-chart-line {
+  fill: none;
+  stroke: #0f6cbd;
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
+}
+
+.km-chart-line.km-alt {
+  stroke: #8764b8;
+}
+
+/* Dải đỏ đánh dấu cơn giật. */
+.km-chart-band {
+  fill: #d13438;
+  fill-opacity: 0.18;
+}
+
+.km-apps {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.km-apps th,
+.km-apps td {
+  padding: 3px 6px;
+}
+
+.km-apps th button {
+  font-weight: 600;
+}
+
+.km-app-icon {
+  width: 16px;
+  height: 16px;
+  flex: none;
+}
+
+.km-proc td:first-child {
+  padding-left: 40px;
+}
+
+.km-stutters {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* Giảm chuyển động: dừng quay nhưng KHÔNG bỏ tín hiệu — đổi sang nhịp mờ tỏ. */
+@media (prefers-reduced-motion: reduce) {
+  .km-busy .fui-Spinner__spinner,
+  .km-busy .fui-Spinner__spinnerTail {
+    animation: none !important;
+  }
+  .km-busy {
+    animation: km-pulse 1.4s ease-in-out infinite;
+  }
+}
+
+@keyframes km-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
