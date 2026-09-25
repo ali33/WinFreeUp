@@ -86,7 +86,10 @@ pub trait Cleaner: Send + Sync {
 
 ### 2.4 Nhật ký
 
-`%LOCALAPPDATA%\WinFreeUp\logs\YYYY-MM-DD_HHmmss.log`: mỗi lượt dọn ghi thời điểm, nhóm, từng
+`%ProgramData%\WinFreeUp\<SID>\logs\YYYY-MM-DD_HHmmss.log` (sửa 2026-09-25: trước là `%LOCALAPPDATA%`,
+đổi vì app chạy Admin mà thư mục đó người dùng thường ghi được — một junction là thành lỗi tạo file tuỳ ý
+bằng quyền Admin). Thư mục `WinFreeUp` và `<SID>` có DACL bảo vệ chỉ SYSTEM + Administrators; thư mục có
+sẵn mà là reparse point hoặc ACL lỏng ⇒ từ chối, không dùng. Mỗi lượt dọn ghi thời điểm, nhóm, từng
 đường dẫn đã xóa/bỏ qua, byte, lỗi. Nút "Xem nhật ký" mở thư mục này.
 
 ## 3. Các nhóm dọn của v0.1

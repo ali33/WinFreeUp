@@ -20,7 +20,7 @@ RAM nhiều nhất, và danh sách vấn đề của máy kèm gợi ý xử lý
 - Một file `.exe`, luôn chạy quyền Admin (`requireAdministrator`), Windows 10 1903+ / 11, 64-bit.
 - Tauri 2 + React + TypeScript + Fluent UI React v9; lõi Rust `winfreeup-core`.
 - Tiếng Việt; chuỗi hiển thị trong `src/i18n/vi.json`.
-- Cùng luật lỗi (băng đỏ/hổ phách, móc lỗi toàn cục), cùng nhật ký `%LOCALAPPDATA%\WinFreeUp\logs\`.
+- Cùng luật lỗi (băng đỏ/hổ phách, móc lỗi toàn cục), cùng nhật ký `%ProgramData%\WinFreeUp\<SID>\logs\` (thư mục DACL chỉ Admin/SYSTEM).
 - **Không cài driver nhân** dưới bất kỳ hình thức nào.
 
 ## 2. Bố cục
