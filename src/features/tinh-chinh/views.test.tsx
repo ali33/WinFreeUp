@@ -7,6 +7,9 @@ import { readResult, report, sample, tw } from './testdata';
 import { itemName } from './labels';
 import type { RunReport, TweakApi, TweakEvent, TweakView } from './types';
 
+/** Nút chân trang khoá bằng `disabledFocusable` (aria-disabled) để focus không rơi về body. */
+const off = (el: HTMLElement) => (el as HTMLButtonElement).disabled || el.getAttribute('aria-disabled') === 'true';
+
 const wrap = (ui: ReactNode) => render(<FluentProvider theme={webLightTheme}>{ui}</FluentProvider>);
 
 function fakeApi(over: Partial<TweakApi> = {}): TweakApi {
@@ -91,7 +94,7 @@ describe('TinhChinhView', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Áp dụng 1 thay đổi' }));
     expect(await screen.findByText(/Đang áp dụng 0\/1/)).toBeTruthy();
     expect((screen.getByRole('button', { name: 'Khuyến nghị' }) as HTMLButtonElement).disabled).toBe(true);
-    expect((screen.getByRole('button', { name: /Hoàn tác đã chọn/ }) as HTMLButtonElement).disabled).toBe(true);
+    expect(off(screen.getByRole('button', { name: /Hoàn tác đã chọn/ }))).toBe(true);
     expect(onBusyChange).toHaveBeenLastCalledWith(true);
     finish();
     expect(await screen.findByText('Kết quả')).toBeTruthy();
@@ -109,7 +112,7 @@ describe('TinhChinhView', () => {
   it('chạy thử ⇒ chỉ xem, nút Áp dụng/Hoàn tác bị khoá', async () => {
     wrap(<TinhChinhView api={fakeApi()} notify={vi.fn()} dryRun />);
     expect(await screen.findByText('Chạy thử: tab này chỉ xem trạng thái, không áp dụng hay hoàn tác.')).toBeTruthy();
-    expect((screen.getByRole('button', { name: 'Áp dụng 1 thay đổi' }) as HTMLButtonElement).disabled).toBe(true);
+    expect(off(screen.getByRole('button', { name: 'Áp dụng 1 thay đổi' }))).toBe(true);
     const row = screen.getByTestId('tweak-app_clipchamp');
     expect((within(row).getByRole('button', { name: 'Cài lại từ Store' }) as HTMLButtonElement).disabled).toBe(true);
     expect((within(screen.getByTestId('tweak-ads_id')).getByRole('checkbox') as HTMLInputElement).disabled).toBe(false);
@@ -148,7 +151,7 @@ describe('TinhChinhView', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Áp dụng 1 thay đổi' }));
     const footer = container.querySelector('.tc-footer') as HTMLElement;
     expect(await within(footer).findByRole('progressbar')).toBeTruthy();
-    expect(within(footer).getByText('Đang tạo điểm khôi phục hệ thống…')).toBeTruthy();
+    expect(within(footer.querySelector('.tc-footer-status') as HTMLElement).getByText('Đang tạo điểm khôi phục hệ thống…')).toBeTruthy();
   });
 
   it('đang chạy ⇒ tiến độ «i/n tên mục» trong chân trang', async () => {
@@ -163,6 +166,8 @@ describe('TinhChinhView', () => {
     const footer = container.querySelector('.tc-footer') as HTMLElement;
     expect(await within(footer).findByText(`Đang áp dụng 0/1… ${itemName('ads_id')}`)).toBeTruthy();
     expect(within(footer).getByRole('progressbar')).toBeTruthy();
+    // Chỉ báo cho trình đọc màn hình khi đổi mục, không đọc lại «i/n» mỗi sự kiện.
+    expect(footer.querySelector('[aria-live]')?.textContent).toBe(itemName('ads_id'));
   });
 
   it('không tạo được điểm khôi phục ⇒ băng hổ phách, chọn Vẫn áp dụng hoặc Dừng lại', async () => {
@@ -231,10 +236,10 @@ describe('TinhChinhView', () => {
     btn.focus();
     fireEvent.click(btn);
     expect(await screen.findByText('Đang khởi động lại Explorer…')).toBeTruthy();
-    expect((screen.getByRole('button', { name: 'Đóng' }) as HTMLButtonElement).disabled).toBe(true);
+    expect(off(screen.getByRole('button', { name: 'Đóng' }))).toBe(true);
     expect(document.activeElement).not.toBe(document.body);
     done();
-    await waitFor(() => expect((screen.getByRole('button', { name: 'Đóng' }) as HTMLButtonElement).disabled).toBe(false));
+    await waitFor(() => expect(off(screen.getByRole('button', { name: 'Đóng' }))).toBe(false));
   });
 
   // Lệch có chủ ý (yêu cầu sau rà Task 11): mục sai build đã áp dụng trước đó ⇒ tích được để hoàn tác.
@@ -249,5 +254,70 @@ describe('TinhChinhView', () => {
     fireEvent.click(box);
     expect(screen.getByRole('button', { name: 'Hoàn tác đã chọn (1)' })).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Áp dụng 1 thay đổi' })).toBeTruthy();
+  });
+
+  // Rà lần 2 (MEDIUM): «Đọc lại» sau khi đọc lại hỏng không được làm mất bảng kết quả.
+  it('bấm Đọc lại khi đang xem kết quả ⇒ bảng kết quả còn nguyên trong lúc đọc và sau khi đọc xong', async () => {
+    let finish: (r: ReturnType<typeof readResult>) => void = () => {};
+    const read = vi
+      .fn()
+      .mockResolvedValueOnce(readResult())
+      .mockRejectedValueOnce('Access is denied.')
+      .mockReturnValueOnce(new Promise((r) => (finish = r)));
+    wrap(<TinhChinhView api={fakeApi({ read })} notify={vi.fn()} dryRun={false} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Áp dụng 1 thay đổi' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Đọc lại' }));
+    expect(await screen.findByText('Đang đọc trạng thái máy… (liệt kê app mất vài giây)')).toBeTruthy();
+    expect(screen.getByText('Kết quả')).toBeTruthy();
+    finish(readResult());
+    expect(await screen.findByText('Quyền riêng tư & quảng cáo')).toBeTruthy();
+    expect(screen.getByText('Kết quả')).toBeTruthy();
+  });
+
+  // Rà lần 2 (MEDIUM): khung kết quả không bị dựng lại khi dữ liệu bị dọn ⇒ không mất trạng thái đang khởi động lại Explorer.
+  it('đang khởi động lại Explorer mà đọc lại hỏng ⇒ vẫn khoá, không bấm được lần hai', async () => {
+    let failRead: (e: unknown) => void = () => {};
+    const read = vi
+      .fn()
+      .mockResolvedValueOnce(readResult())
+      .mockReturnValueOnce(new Promise((_, rej) => (failRead = rej)));
+    const api = fakeApi({ read, restartExplorer: vi.fn(() => new Promise<void>(() => {})) });
+    wrap(<TinhChinhView api={api} notify={vi.fn()} dryRun={false} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Áp dụng 1 thay đổi' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Khởi động lại Explorer' }));
+    expect(await screen.findByText('Đang khởi động lại Explorer…')).toBeTruthy();
+    failRead('Access is denied.');
+    expect(await screen.findByText('Không đọc được trạng thái máy: Access is denied.')).toBeTruthy();
+    expect(screen.getByText('Đang khởi động lại Explorer…')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Khởi động lại Explorer' })).toBeNull();
+    expect(off(screen.getByRole('button', { name: 'Đóng' }))).toBe(true);
+    expect(api.restartExplorer).toHaveBeenCalledTimes(1);
+  });
+
+  // Rà lần 2 (LOW): đóng kết quả / dừng sau điểm khôi phục hỏng ⇒ focus về nút Áp dụng, không rơi về body.
+  it('đóng kết quả ⇒ focus về nút Áp dụng', async () => {
+    wrap(<TinhChinhView api={fakeApi()} notify={vi.fn()} dryRun={false} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Áp dụng 1 thay đổi' }));
+    const close = await screen.findByRole('button', { name: 'Đóng' });
+    await waitFor(() => expect(off(close)).toBe(false));
+    close.focus();
+    fireEvent.click(close);
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Áp dụng 1 thay đổi' })));
+  });
+
+  it('dừng sau điểm khôi phục hỏng ⇒ focus về nút Áp dụng', async () => {
+    const api = fakeApi({ prepareRestorePoint: vi.fn(async () => ({ status: 'failed' as const, message: 'off' })) });
+    wrap(<TinhChinhView api={api} notify={vi.fn()} dryRun={false} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Áp dụng 1 thay đổi' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Dừng lại' }));
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Áp dụng 1 thay đổi' })));
+  });
+
+  // Rà lần 2 (LOW): khung kết quả là vùng có tên, không phải aria-live (đã nhận focus ⇒ không đọc hai lần).
+  it('khung kết quả là region mang tên «Kết quả», không aria-live', async () => {
+    wrap(<TinhChinhView api={fakeApi()} notify={vi.fn()} dryRun={false} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Áp dụng 1 thay đổi' }));
+    const region = await screen.findByRole('region', { name: 'Kết quả' });
+    expect(region.closest('[aria-live]')).toBeNull();
   });
 });

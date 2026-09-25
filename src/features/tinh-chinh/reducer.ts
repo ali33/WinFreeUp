@@ -80,7 +80,9 @@ function startRun(s: TState, kind: RunKind, ids: string[]): TState {
 export function reducer(s: TState, a: TAction): TState {
   switch (a.type) {
     case 'LOAD_STARTED':
-      return s.data ? { ...s, reloading: true, loadError: null } : { ...s, phase: 'loading', loadError: null };
+      if (s.data) return { ...s, reloading: true, loadError: null };
+      // Đang xem kết quả mà dữ liệu đã bị dọn (đọc lại hỏng) ⇒ giữ phase done để không mất bảng kết quả.
+      return { ...s, phase: s.phase === 'done' ? 'done' : 'loading', loadError: null };
     case 'LOADED': {
       const tweaks = a.data.tweaks;
       const allowed = new Set(tweaks.filter(checkable).map((t) => t.id));
@@ -109,6 +111,7 @@ export function reducer(s: TState, a: TAction): TState {
       const ids = pendingChanges(s.data.tweaks, s.selected);
       if (ids.length === 0) return s;
       // Chạy bằng tài khoản admin khác ⇒ luôn hỏi lại (mục theo tài khoản sẽ áp cho tài khoản admin đó).
+      // Cố ý chỉ hỏi cho Áp dụng: hoàn tác đưa máy về như cũ nên không hỏi (lệch có chủ ý, rà Task 11).
       const ask = s.data.system.other_user || needsConfirm(s.data.tweaks, ids, s.allUsers).length > 0;
       return ask ? { ...s, phase: 'confirm' } : { ...s, phase: 'restorePoint', restore: null };
     }

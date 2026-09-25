@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import { Button, MessageBar, MessageBarBody } from '@fluentui/react-components';
 import { Busy } from '../../components/Busy';
 import { itemName, outcomeText } from './labels';
@@ -14,12 +14,14 @@ export function runLabel(state: TState): string | null {
 }
 
 /**
- * Kết quả từng mục (lỗi nguyên văn) và việc cần khởi động lại khi xong. Vùng aria-live luôn tồn tại để trình đọc
- * màn hình báo khi kết quả hiện; kết quả hiện ⇒ cuộn tới và đặt focus vào khung.
+ * Kết quả từng mục (lỗi nguyên văn) và việc cần khởi động lại khi xong. Kết quả hiện ⇒ cuộn tới và đặt focus vào
+ * khung (region mang tên «Kết quả»); vì đã nhận focus nên không dùng aria-live, tránh trình đọc màn hình đọc hai lần.
+ * TinhChinhView giữ component này ở cùng vị trí con ở mọi nhánh để `restarting` không bị mất khi dữ liệu bị dọn.
  */
 export function RunPanel({ state, onRestartExplorer, onClose }: { state: TState; onRestartExplorer: () => Promise<void>; onClose: () => void }) {
   const [restarting, setRestarting] = useState(false);
   const panel = useRef<HTMLDivElement>(null);
+  const titleId = useId();
   const run = state.run;
   const report = state.report;
   const show = state.phase === 'done' && !!run && !!report;
@@ -28,7 +30,7 @@ export function RunPanel({ state, onRestartExplorer, onClose }: { state: TState;
     panel.current.scrollIntoView?.({ block: 'nearest' });
     panel.current.focus();
   }, [show]);
-  if (!show || !run || !report) return <div aria-live="polite" />;
+  if (!show || !run || !report) return null;
   const restartExplorer = async () => {
     // Nút sắp bị thay bằng vòng quay ⇒ chuyển focus về khung kết quả, không để rơi về body.
     panel.current?.focus();
@@ -40,9 +42,11 @@ export function RunPanel({ state, onRestartExplorer, onClose }: { state: TState;
     }
   };
   return (
-    <div aria-live="polite">
-      <div className="tc-panel" ref={panel} tabIndex={-1}>
-        <h3 className="tc-section-title">{tt('tweaks.result.title')}</h3>
+    <div>
+      <div className="tc-panel" ref={panel} tabIndex={-1} role="region" aria-labelledby={titleId}>
+        <h3 className="tc-section-title" id={titleId}>
+          {tt('tweaks.result.title')}
+        </h3>
         <ul className="tc-results">
           {report.outcomes.map((o) => (
             <li key={o.id}>
@@ -75,7 +79,7 @@ export function RunPanel({ state, onRestartExplorer, onClose }: { state: TState;
                 {tt('tweaks.result.explorer')}
               </Button>
             ))}
-          <Button disabled={restarting} onClick={onClose}>
+          <Button disabledFocusable={restarting} onClick={onClose}>
             {tt('tweaks.result.close')}
           </Button>
         </div>

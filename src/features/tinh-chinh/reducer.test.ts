@@ -138,3 +138,18 @@ describe('mục chỉ hoàn tác', () => {
     expect(s.selected).toContain('old_tweak');
   });
 });
+
+// Lệch có chủ ý (rà lần 2 Task 11): đọc lại khi đang ở bảng kết quả mà chưa có dữ liệu ⇒ không mất bảng kết quả.
+describe('đọc lại khi đang xem kết quả', () => {
+  it('LOAD_STARTED giữ phase done khi dữ liệu đã bị dọn', () => {
+    let s = run([{ type: 'REQUEST_APPLY' }, { type: 'RESTORE_RESULT', status: { status: 'created' } }, { type: 'RUN_STARTED', kind: 'apply', ids: ['ads_id'] }, { type: 'RUN_DONE', report: report() }], loaded());
+    s = run([{ type: 'LOAD_STARTED' }, { type: 'LOAD_FAILED', message: 'x' }], s);
+    expect(s.phase).toBe('done');
+    expect(s.data).toBeNull();
+    s = reducer(s, { type: 'LOAD_STARTED' });
+    expect(s.phase).toBe('done');
+    expect(s.report).not.toBeNull();
+    s = reducer(s, { type: 'LOADED', data: readResult() });
+    expect(s.phase).toBe('done');
+  });
+});
