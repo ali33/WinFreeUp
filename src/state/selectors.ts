@@ -24,7 +24,7 @@ export function confirmKind(groups: GroupState[], selected: string[]): ConfirmKi
 export function isConfirmWord(input: string): boolean {
   const plain = input
     .normalize('NFD')
-    .replace(/[̀-ͯ]/g, '')
+    .replace(/[\u0300-\u036f]/g, '')
     .replace(/[đĐ]/g, 'd')
     .trim()
     .toUpperCase();
