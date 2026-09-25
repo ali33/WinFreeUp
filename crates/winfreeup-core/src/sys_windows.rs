@@ -10,13 +10,13 @@ use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::process::{Child, Command, Stdio};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use windows_sys::core::{BOOL, PCWSTR, PWSTR};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, LocalFree, ERROR_ALREADY_EXISTS, ERROR_NOT_ALL_ASSIGNED, HANDLE, INVALID_HANDLE_VALUE,
-    LUID,
+    CloseHandle, GetLastError, LocalFree, ERROR_ALREADY_EXISTS, ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA,
+    ERROR_NOT_ALL_ASSIGNED, HANDLE, INVALID_HANDLE_VALUE, LUID,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SetEntriesInAclW,
@@ -24,7 +24,8 @@ use windows_sys::Win32::Security::Authorization::{
     TRUSTEE_IS_SID, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::{
-    AdjustTokenPrivileges, CreateWellKnownSid, GetSecurityDescriptorControl, InitializeSecurityDescriptor,
+    AdjustTokenPrivileges, CreateWellKnownSid, GetSecurityDescriptorControl, GetTokenInformation,
+    InitializeSecurityDescriptor, TokenUser, TOKEN_USER,
     LookupPrivilegeValueW, SetKernelObjectSecurity, SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
     SetSecurityDescriptorOwner, WinBuiltinAdministratorsSid, ACL, DACL_SECURITY_INFORMATION, LUID_AND_ATTRIBUTES,
     NO_INHERITANCE, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
@@ -45,6 +46,9 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
     TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+};
+use windows_sys::Win32::System::Registry::{
+    RegGetValueW, HKEY_LOCAL_MACHINE, RRF_NOEXPAND, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
 };
 use windows_sys::Win32::System::SystemInformation::{GetSystemDirectoryW, GetSystemWindowsDirectoryW};
 use windows_sys::Win32::System::Threading::{
@@ -74,6 +78,11 @@ const MAX_ERROR_CHARS: usize = 200;
 const TRUSTED_INSTALLER_SID: &str = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
 /// Thư mục tạm riêng cho DISM: chỉ SYSTEM và Administrators, không kế thừa gì từ cha.
 const PRIVATE_DIR_SDDL: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+/// Khóa HKLM chứa ProgramData và hồ sơ người dùng (chỉ Admin/SYSTEM ghi được).
+const PROFILE_LIST_KEY: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList";
+
+/// Một take_ownership tại một thời điểm (đặc quyền bật/tắt cho cả tiến trình).
+static TAKE_OWNERSHIP_LOCK: Mutex<()> = Mutex::new(());
 
 fn wide(s: &OsStr) -> Vec<u16> {
     s.encode_wide().chain(std::iter::once(0)).collect()
@@ -258,6 +267,120 @@ pub(crate) fn windows_dir() -> Result<PathBuf> {
 
 pub(crate) fn system_dir() -> Result<PathBuf> {
     api_dir(GetSystemDirectoryW, "GetSystemDirectoryW")
+}
+
+/// `C:\Windows` → `C:`.
+fn system_drive_letter(windir: &Path) -> Result<String> {
+    match windir.components().next() {
+        Some(Component::Prefix(p)) => match p.kind() {
+            Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => Ok(format!("{}:", letter as char)),
+            _ => Err(CoreError::System(format!("windows directory has no drive letter: {}", windir.display()))),
+        },
+        _ => Err(CoreError::System(format!("windows directory has no drive letter: {}", windir.display()))),
+    }
+}
+
+/// Thay `%SystemDrive%` (không phân biệt hoa thường) bằng `drive`. Chuỗi còn biến `%…%` nào khác thì từ
+/// chối: không mở rộng theo biến môi trường của tiến trình (người dùng thường đặt được).
+fn substitute_system_drive(raw: &str, drive: &str) -> Result<PathBuf> {
+    const VAR: &str = "%systemdrive%";
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(i) = rest.to_ascii_lowercase().find(VAR) {
+        out.push_str(&rest[..i]);
+        out.push_str(drive);
+        rest = &rest[i + VAR.len()..];
+    }
+    out.push_str(rest);
+    if out.contains('%') {
+        return Err(CoreError::System(format!("unexpected environment variable in registry path: {raw}")));
+    }
+    if out.is_empty() {
+        return Err(CoreError::System("empty registry path".into()));
+    }
+    Ok(PathBuf::from(out))
+}
+
+/// Đọc chuỗi (REG_SZ/REG_EXPAND_SZ) dưới HKLM, KHÔNG để Windows tự mở rộng biến môi trường.
+fn read_hklm_string(subkey: &str, value: &str) -> Result<String> {
+    let key = wide(OsStr::new(subkey));
+    let name = wide(OsStr::new(value));
+    let mut buf = vec![0u16; 260];
+    loop {
+        let mut cb = (buf.len() * 2) as u32;
+        // SAFETY: chuỗi kết thúc NUL; buf khả ghi đúng cb byte; kiểu trả về không cần (null).
+        let err = unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                key.as_ptr(),
+                name.as_ptr(),
+                RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND,
+                std::ptr::null_mut(),
+                buf.as_mut_ptr().cast(),
+                &mut cb,
+            )
+        };
+        if err == ERROR_MORE_DATA {
+            buf.resize((cb as usize).div_ceil(2) + 1, 0);
+            continue;
+        }
+        if err != 0 {
+            return Err(CoreError::System(format!(
+                r"HKLM\{subkey}\{value}: {}",
+                io::Error::from_raw_os_error(err as i32)
+            )));
+        }
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        return Ok(String::from_utf16_lossy(&buf[..len]));
+    }
+}
+
+/// ProgramData theo HKLM (`ProfileList\ProgramData`, thường là `%SystemDrive%\ProgramData`).
+fn program_data_dir(drive: &str) -> Result<PathBuf> {
+    substitute_system_drive(&read_hklm_string(PROFILE_LIST_KEY, "ProgramData")?, drive)
+}
+
+/// SID người dùng của token tiến trình, dạng chuỗi.
+fn current_user_sid() -> Result<String> {
+    let fail = |what: &str, e: io::Error| CoreError::System(format!("{what}: {e}"));
+    let mut raw: HANDLE = std::ptr::null_mut();
+    // SAFETY: pseudo-handle tiến trình luôn hợp lệ; raw là biến cục bộ; handle do OwnedHandle đóng.
+    check(unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw) })
+        .map_err(|e| fail("OpenProcessToken", e))?;
+    let token = OwnedHandle(raw);
+    // Bộ đệm u64 để TOKEN_USER (chứa con trỏ) được căn đúng.
+    let mut buf = vec![0u64; 16];
+    loop {
+        let mut needed = 0u32;
+        // SAFETY: buf khả ghi đúng số byte truyền vào; needed là biến cục bộ.
+        let ok = unsafe {
+            GetTokenInformation(token.0, TokenUser, buf.as_mut_ptr().cast(), (buf.len() * 8) as u32, &mut needed)
+        };
+        if ok != 0 {
+            break;
+        }
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32) {
+            return Err(fail("GetTokenInformation(TokenUser)", e));
+        }
+        buf.resize((needed as usize).div_ceil(8), 0);
+    }
+    // SAFETY: GetTokenInformation vừa ghi một TOKEN_USER hợp lệ ở đầu buf (căn 8 byte); SID nằm trong buf.
+    let sid = unsafe { (*(buf.as_ptr() as *const TOKEN_USER)).User.Sid };
+    let mut text: PWSTR = std::ptr::null_mut();
+    // SAFETY: sid trỏ vào buf còn sống; text do LocalMem giải phóng.
+    check(unsafe { ConvertSidToStringSidW(sid, &mut text) }).map_err(|e| fail("ConvertSidToStringSidW", e))?;
+    let _text = LocalMem(text.cast());
+    // SAFETY: text là chuỗi kết thúc NUL do API cấp, còn sống tới hết hàm.
+    Ok(unsafe { wide_ptr_to_string(text) })
+}
+
+/// Thư mục hồ sơ của người dùng sở hữu token tiến trình, theo HKLM (`ProfileList\<SID>\ProfileImagePath`).
+/// Nâng quyền bằng một tài khoản Admin khác thì đây là hồ sơ của tài khoản đó.
+fn user_profile_dir(drive: &str) -> Result<PathBuf> {
+    let sid = current_user_sid()?;
+    let raw = read_hklm_string(&format!(r"{PROFILE_LIST_KEY}\{sid}"), "ProfileImagePath")?;
+    substitute_system_drive(&raw, drive)
 }
 
 /// `C:\Windows` → `C:\`.
@@ -1034,6 +1157,9 @@ impl SystemOps for RealSystem {
     /// Mỗi mục được kiểm trên chính handle sẽ sửa (không liên kết, không hard link, đường dẫn thật trong gốc).
     /// Làm đủ cả hai bước cho mọi mục; lỗi gộp lại sau khi chạy hết.
     fn take_ownership(&self, path: &Path) -> Result<()> {
+        // Đặc quyền bật cho cả tiến trình: hai lời gọi chồng nhau thì lời xong trước sẽ tắt đặc quyền
+        // của lời kia giữa chừng. Khóa suốt từ lúc bật tới lúc trả đặc quyền.
+        let _serial = TAKE_OWNERSHIP_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let what = format!("take_ownership {}", path.display());
         let admins = AdminsSid::new().map_err(|e| CoreError::System(format!("{what}: Administrators SID: {e}")))?;
         let mut notes = Vec::new();
@@ -1053,20 +1179,18 @@ impl SystemOps for RealSystem {
 }
 
 impl Env {
+    /// Mọi đường dẫn lấy qua API/HKLM, không qua biến môi trường (TEMP, LOCALAPPDATA, ProgramData…):
+    /// mã độc không cần Admin ghi được HKCU\Environment, trỏ TEMP về C:\Windows\System32 chẳng hạn.
     pub fn from_system() -> Result<Env> {
-        fn var(name: &str) -> Result<PathBuf> {
-            std::env::var_os(name)
-                .filter(|v| !v.is_empty())
-                .map(PathBuf::from)
-                .ok_or_else(|| CoreError::System(format!("environment variable {name} is not set")))
-        }
         let windir = windows_dir()?;
+        let drive = system_drive_letter(&windir)?;
+        let local_appdata = user_profile_dir(&drive)?.join(r"AppData\Local");
         Ok(Env {
-            temp: std::env::temp_dir(),
+            temp: local_appdata.join("Temp"),
             system_drive: drive_root(&windir)?,
             windir,
-            local_appdata: var("LOCALAPPDATA")?,
-            program_data: var("ProgramData")?,
+            local_appdata,
+            program_data: program_data_dir(&drive)?,
             now: SystemTime::now(),
             sys: Arc::new(RealSystem { system32: system_dir()? }),
         })
@@ -1111,38 +1235,53 @@ mod tests {
 
     const FAKE_ENV_CHILD: &str = "WFU_FAKE_ENV_CHILD";
 
-    /// Chạy lại chính test này trong tiến trình con có SystemRoot/windir/SystemDrive giả — không `set_var`
-    /// trong tiến trình test (các test khác chạy song song đọc chung môi trường).
+    /// Các đường dẫn của Env, nối bằng `|`, để so giữa tiến trình test và tiến trình con.
+    fn env_paths(env: &Env) -> String {
+        [&env.temp, &env.windir, &env.local_appdata, &env.program_data, &env.system_drive]
+            .map(|p| p.display().to_string())
+            .join("|")
+    }
+
+    /// Chạy lại chính test này trong tiến trình con có SystemRoot/windir/SystemDrive/ProgramData/TEMP/TMP/
+    /// LOCALAPPDATA/USERPROFILE giả — kết quả phải y hệt tiến trình test. Không `set_var` trong tiến trình
+    /// test (các test khác chạy song song đọc chung môi trường).
     #[test]
     fn system_dirs_come_from_the_api_not_from_environment_variables() {
         if let Some(fake) = std::env::var_os(FAKE_ENV_CHILD) {
             let fake = PathBuf::from(fake);
             assert_eq!(std::env::var_os("windir"), Some(fake.clone().into_os_string()), "env not faked");
+            assert_eq!(std::env::temp_dir(), fake, "env not faked");
             let windir = windows_dir().unwrap();
             let system32 = system_dir().unwrap();
             let env = Env::from_system().unwrap();
             assert_ne!(windir, fake);
             assert_eq!(env.windir, windir);
-            assert!(!env.system_drive.starts_with(&fake));
+            let expected = std::env::var("WFU_EXPECTED_ENV").unwrap();
+            assert_eq!(env_paths(&env), expected);
+            for p in [&env.temp, &env.local_appdata, &env.program_data, &env.system_drive] {
+                assert!(!p.starts_with(&fake), "{}", p.display());
+            }
             assert!(system32.starts_with(&windir), "{}", system32.display());
             assert!(system32.join("Dism.exe").is_file());
             let child = child_env(&windir, &system32);
             assert!(child.iter().all(|(_, v)| !Path::new(v).starts_with(&fake)));
             return;
         }
+        let expected = env_paths(&Env::from_system().unwrap());
         let fake = tempfile::tempdir().unwrap();
-        let out = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "sys_windows::tests::system_dirs_come_from_the_api_not_from_environment_variables",
-                "--test-threads=1",
-            ])
-            .env(FAKE_ENV_CHILD, fake.path())
-            .env("SystemRoot", fake.path())
-            .env("windir", fake.path())
-            .env("SystemDrive", "Z:")
-            .output()
-            .unwrap();
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args([
+            "--exact",
+            "sys_windows::tests::system_dirs_come_from_the_api_not_from_environment_variables",
+            "--test-threads=1",
+        ])
+        .env(FAKE_ENV_CHILD, fake.path())
+        .env("WFU_EXPECTED_ENV", &expected)
+        .env("SystemDrive", "Z:");
+        for k in ["SystemRoot", "windir", "ProgramData", "TEMP", "TMP", "LOCALAPPDATA", "USERPROFILE"] {
+            cmd.env(k, fake.path());
+        }
+        let out = cmd.output().unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
         assert!(stdout.contains("1 passed"), "{stdout}");
@@ -1178,6 +1317,31 @@ mod tests {
             .unwrap();
         let expected = format!("{}|{}|wuauserv", windir.join("Temp").display(), ps_modules_dir(&system32).display());
         assert!(out.eq_ignore_ascii_case(&expected), "{out}");
+    }
+
+    #[test]
+    fn system_drive_is_substituted_without_expanding_the_environment() {
+        assert_eq!(system_drive_letter(Path::new(r"C:\Windows")).unwrap(), "C:");
+        assert_eq!(system_drive_letter(Path::new(r"\\?\D:\Windows")).unwrap(), "D:");
+        assert!(system_drive_letter(Path::new(r"Windows")).is_err());
+        assert_eq!(substitute_system_drive(r"%SystemDrive%\ProgramData", "C:").unwrap(), PathBuf::from(r"C:\ProgramData"));
+        assert_eq!(substitute_system_drive(r"%SYSTEMDRIVE%\Users\a", "D:").unwrap(), PathBuf::from(r"D:\Users\a"));
+        assert_eq!(substitute_system_drive(r"E:\Users\a", "C:").unwrap(), PathBuf::from(r"E:\Users\a"));
+        assert!(substitute_system_drive(r"%USERPROFILE%\x", "C:").is_err());
+        assert!(substitute_system_drive("", "C:").is_err());
+    }
+
+    #[test]
+    fn profile_and_program_data_come_from_hklm() {
+        let drive = system_drive_letter(&windows_dir().unwrap()).unwrap();
+        assert!(current_user_sid().unwrap().starts_with("S-1-5-"));
+        let profile = user_profile_dir(&drive).unwrap();
+        let program_data = program_data_dir(&drive).unwrap();
+        assert!(profile.is_dir() && program_data.is_dir(), "{} {}", profile.display(), program_data.display());
+        let env = Env::from_system().unwrap();
+        assert_eq!(env.local_appdata, profile.join(r"AppData\Local"));
+        assert_eq!(env.temp, env.local_appdata.join("Temp"));
+        assert_eq!(env.program_data, program_data);
     }
 
     #[test]
