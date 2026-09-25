@@ -123,7 +123,8 @@ export function reducer(s: TState, a: TAction): TState {
       return s.phase === 'restorePoint' && s.restore?.status === 'failed' ? { ...s, phase: 'ready', restore: null } : s;
     case 'RUN_STARTED':
       if (a.kind === 'apply' && !(s.phase === 'restorePoint' && s.restore !== null && s.restore.status !== 'failed')) return s;
-      if (a.kind === 'revert' && s.phase !== 'ready') return s;
+      // Hoàn tác không chạy khi đang đọc lại (như REQUEST_APPLY) — danh sách đang chờ số thật.
+      if (a.kind === 'revert' && (s.phase !== 'ready' || s.reloading)) return s;
       return startRun(s, a.kind, a.ids);
     case 'RUN_EVENT': {
       if (s.phase !== 'running' || !s.run) return s;

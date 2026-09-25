@@ -109,4 +109,11 @@ describe('luồng áp dụng', () => {
     expect(reducer(s, { type: 'REQUEST_APPLY' })).toBe(s);
     expect(reducer(s, { type: 'RUN_FAILED' }).phase).toBe('ready');
   });
+
+  // Lệch có chủ ý (rà Task 10): hoàn tác cũng bị chặn khi đang đọc lại, như REQUEST_APPLY.
+  it('đang đọc lại thì không bắt đầu hoàn tác', () => {
+    const s = reducer(loaded(), { type: 'LOAD_STARTED' });
+    expect(s.reloading).toBe(true);
+    expect(reducer(s, { type: 'RUN_STARTED', kind: 'revert', ids: ['app_clipchamp'] })).toBe(s);
+  });
 });

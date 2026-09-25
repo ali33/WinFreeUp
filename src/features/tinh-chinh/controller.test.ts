@@ -108,4 +108,37 @@ describe('bộ điều khiển Tinh chỉnh', () => {
     await c.restartExplorer(d);
     expect(notify).toHaveBeenCalledWith('error', 'Không khởi động lại được Explorer: taskkill: Access is denied.');
   });
+
+  // Lệch có chủ ý (rà Task 10): ba test dưới.
+  it('bấm đúp «Áp dụng» chỉ tạo điểm khôi phục một lần', async () => {
+    const { d, api } = setup();
+    await c.load(d);
+    const first = c.requestApply(d);
+    await c.requestApply(d);
+    await first;
+    expect(api.prepareRestorePoint).toHaveBeenCalledTimes(1);
+    expect(api.apply).toHaveBeenCalledTimes(1);
+  });
+
+  it('bấm đúp «Đồng ý» ở hộp xác nhận chỉ tạo điểm khôi phục một lần', async () => {
+    const { d, store, api } = setup();
+    await c.load(d);
+    c.preset(d, 'recommended');
+    await c.requestApply(d);
+    expect(store.getState().phase).toBe('confirm');
+    const first = c.acceptConfirm(d);
+    await c.acceptConfirm(d);
+    await first;
+    expect(api.prepareRestorePoint).toHaveBeenCalledTimes(1);
+    expect(api.apply).toHaveBeenCalledTimes(1);
+  });
+
+  it('báo cáo thiếu notices ⇒ không báo nhầm «Áp dụng không xong»', async () => {
+    const bare = { outcomes: [], restart: 'none' } as unknown as RunReport;
+    const { d, store, notify } = setup(fakeApi({ apply: vi.fn(async () => bare) }));
+    await c.load(d);
+    await c.requestApply(d);
+    expect(store.getState().phase).toBe('done');
+    expect(notify).not.toHaveBeenCalledWith('error', expect.anything());
+  });
 });

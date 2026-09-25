@@ -68,14 +68,17 @@ async function execute(d: TDeps, kind: RunKind, ids: string[]): Promise<void> {
   if (d.store.getState() === before) return;
   const allUsers = d.store.getState().allUsers;
   const onEvent = (event: TweakEvent) => d.store.dispatch({ type: 'RUN_EVENT', event });
+  let notices: string[] = [];
   try {
     const report = kind === 'apply' ? await d.api.apply(ids, allUsers, onEvent) : await d.api.revert(ids, onEvent);
     d.store.dispatch({ type: 'RUN_DONE', report });
-    report.notices.forEach((n) => d.notify('warning', noticeText(n)));
+    notices = report.notices ?? [];
   } catch (e) {
     d.store.dispatch({ type: 'RUN_FAILED' });
     d.notify('error', tt(kind === 'apply' ? 'tweaks.errors.applyFailed' : 'tweaks.errors.revertFailed', { message: friendlyT(e) }));
   }
+  // Ngoài try: lỗi khi báo notices không được đổi thành «Áp dụng không xong» sau khi lệnh đã xong.
+  notices.forEach((n) => d.notify('warning', noticeText(n)));
   await load(d);
 }
 
@@ -97,12 +100,17 @@ async function runApply(d: TDeps): Promise<void> {
 }
 
 export async function requestApply(d: TDeps): Promise<void> {
+  const before = d.store.getState();
   d.store.dispatch({ type: 'REQUEST_APPLY' });
+  // Reducer từ chối (vd bấm đúp khi đang tạo điểm khôi phục) ⇒ không tạo lần hai.
+  if (d.store.getState() === before) return;
   if (d.store.getState().phase === 'restorePoint') await createRestorePoint(d);
 }
 
 export async function acceptConfirm(d: TDeps): Promise<void> {
+  const before = d.store.getState();
   d.store.dispatch({ type: 'CONFIRM_ACCEPTED' });
+  if (d.store.getState() === before) return;
   if (d.store.getState().phase === 'restorePoint') await createRestorePoint(d);
 }
 
