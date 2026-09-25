@@ -14,8 +14,33 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 use crate::util;
 
-/// Tên đặc biệt ngay dưới gốc bất kỳ ổ nào.
-const ROOT_SPECIAL: [&str; 5] = ["pagefile.sys", "hiberfil.sys", "swapfile.sys", "system volume information", "$recycle.bin"];
+/// Tên ngay dưới gốc bất kỳ ổ nào mà xóa đi thì hỏng hệ thống: tệp hoán trang/ngủ đông, dữ liệu khôi phục,
+/// khởi động, và metafile NTFS. KHÔNG chặn mọi tên bắt đầu bằng `$`: `$WINDOWS.~BT`, `$Windows.~WS`,
+/// `$GetCurrent`, `$SysReset` là phần thừa sau cập nhật/cài lại Windows, dọn được.
+const ROOT_SPECIAL: [&str; 22] = [
+    "pagefile.sys",
+    "hiberfil.sys",
+    "swapfile.sys",
+    "system volume information",
+    "$recycle.bin",
+    "$winreagent",
+    "bootmgr",
+    "bootnxt",
+    "boot",
+    "recovery",
+    "efi",
+    "$mft",
+    "$mftmirr",
+    "$logfile",
+    "$volume",
+    "$attrdef",
+    "$bitmap",
+    "$boot",
+    "$badclus",
+    "$secure",
+    "$upcase",
+    "$extend",
+];
 
 /// Bit «name surrogate» của reparse tag: junction, symlink, mount point… trỏ sang chỗ khác. Reparse point không
 /// có bit này (vd thư mục OneDrive, dedup) không dẫn đi đâu, và bộ quét vẫn đi vào chúng.
@@ -25,13 +50,26 @@ const NAME_SURROGATE: u32 = 0x2000_0000;
 pub struct ProtectRules {
     /// Chặn chính nó và mọi thứ bên trong: `%WINDIR%`, `Program Files`, `Program Files (x86)`, `ProgramData`, `C:\Users`.
     system_dirs: Vec<String>,
-    /// `%USERPROFILE%` (và đường thật của nó nếu khác): chặn chính nó; con bên trong được xóa.
-    user_profiles: Vec<String>,
+    /// `%USERPROFILE%` (và đường thật của nó nếu khác): chặn chính nó. `true` = con bên trong được xóa — chỉ khi
+    /// hồ sơ không nằm trong thư mục hệ thống nào ngoài thư mục cha của nó (thư mục Users).
+    user_profiles: Vec<(String, bool)>,
 }
 
 impl ProtectRules {
     pub fn new(system_dirs: &[PathBuf], user_profile: &Path) -> Self {
-        ProtectRules { system_dirs: system_dirs.iter().map(|p| key(p)).collect(), user_profiles: vec![key(user_profile)] }
+        Self::from_keys(system_dirs.iter().map(|p| key(p)).collect(), vec![key(user_profile)])
+    }
+
+    fn from_keys(system_dirs: Vec<String>, profiles: Vec<String>) -> Self {
+        let user_profiles = profiles
+            .into_iter()
+            .map(|p| {
+                let parent = p.rsplit_once('\\').map(|(dir, _)| dir);
+                let exempt = !system_dirs.iter().any(|d| is_within(&p, d) && Some(d.as_str()) != parent);
+                (p, exempt)
+            })
+            .collect();
+        ProtectRules { system_dirs, user_profiles }
     }
 
     /// Luật của máy đang chạy, lấy qua API/registry (`util`), KHÔNG qua biến môi trường: tiến trình chạy quyền
@@ -40,6 +78,9 @@ impl ProtectRules {
     /// Thư mục hồ sơ chung (`C:\Users`) = thư mục cha của hồ sơ người dùng. Không đọc HKLM
     /// `ProfileList\ProfilesDirectory`: hàm đọc registry của `util` là nội bộ, và thư mục cha của hồ sơ thật
     /// (cũng lấy từ HKLM `ProfileList\<SID>`) cho cùng kết quả trên máy thường.
+    ///
+    /// Hồ sơ (hoặc đường thật của nó) nằm trong Windows/ProgramData/Program Files ⇒ `Err`: luật miễn trừ con
+    /// trong hồ sơ sẽ mở cửa vào thư mục hệ thống.
     pub fn from_system() -> Result<Self, String> {
         let profile = util::user_profile()?;
         let users = profile
@@ -47,72 +88,103 @@ impl ProtectRules {
             .filter(|p| p.parent().is_some())
             .ok_or_else(|| format!("user profile has no parent directory: {}", profile.display()))?
             .to_path_buf();
-        let dirs = vec![
-            util::windows_dir()?,
-            util::program_data()?,
-            util::program_files()?,
-            util::program_files_x86()?,
-            users,
-        ];
-        let mut rules = ProtectRules::new(&dirs, &profile);
+        let system = [util::windows_dir()?, util::program_data()?, util::program_files()?, util::program_files_x86()?];
         // Thư mục bị dời bằng junction (vd `C:\Users` → `D:\Users`): chặn cả đường thật, để đi thẳng vào đích
         // (quét ổ D:) cũng bị chặn như đi qua tên cũ.
-        for d in &dirs {
-            if let Ok(real) = std::fs::canonicalize(d) {
-                push_unique(&mut rules.system_dirs, key(&real));
+        let with_real = |dirs: &[&Path]| {
+            let mut keys = Vec::new();
+            for d in dirs {
+                push_unique(&mut keys, key(d));
+                if let Ok(real) = std::fs::canonicalize(d) {
+                    push_unique(&mut keys, key(&real));
+                }
             }
+            keys
+        };
+        let system_keys = with_real(&system.iter().map(PathBuf::as_path).collect::<Vec<_>>());
+        let profile_keys = with_real(&[profile.as_path()]);
+        check_profiles(&system_keys, &profile_keys)?;
+        let mut dirs = system_keys;
+        for k in with_real(&[users.as_path()]) {
+            push_unique(&mut dirs, k);
         }
-        if let Ok(real) = std::fs::canonicalize(&profile) {
-            push_unique(&mut rules.user_profiles, key(&real));
-        }
-        Ok(rules)
+        Ok(Self::from_keys(dirs, profile_keys))
     }
 
-    /// Cửa chặn ngay trước khi xóa — `true` (chặn) khi:
-    /// - đường dẫn có hình dạng lạ: tương đối, thiếu `\` sau ổ, tiền tố thiết bị (`\\.\`, `\\?\GLOBALROOT`,
-    ///   `\\?\Volume{…}`), có `.`/`..`, có `:` (luồng dữ liệu) hay ký tự đại diện;
-    /// - đường gõ vào bị luật chặn;
-    /// - BẤT KỲ thư mục tổ tiên nào (dưới gốc ổ, trên đích) là junction/symlink/mount point, không phải thư mục,
-    ///   hoặc không đọc được thuộc tính. Bộ quét không đi theo link nên nút hợp lệ không bao giờ nằm dưới link;
-    ///   gặp link nghĩa là cây đã bị tráo sau khi quét (TOCTOU) và lệnh xóa có thể bị dẫn vào thư mục hệ thống;
-    /// - đường thật sau `canonicalize` bị luật chặn (bản thân đích là link thì chỉ chặn vì lý do này — xóa link
-    ///   không xóa đích), hoặc `canonicalize` hỏng vì lý do khác «không có».
+    /// Có bị chặn xóa không — `protect_reason(path).is_some()`.
+    ///
+    /// Đây chỉ là BƯỚC KIỂM, không phải khóa: giữa lúc kiểm và lúc xóa đường dẫn vẫn có thể bị tráo. Người xóa
+    /// phải kiểm lại ngay trước thao tác, trong lúc giữ khóa (handle mở, không cho xóa/đổi tên) các thư mục tổ tiên.
     pub fn is_protected(&self, path: &Path) -> bool {
+        self.protect_reason(path).is_some()
+    }
+
+    /// Mã lý do chặn (lõi không chứa chữ hiển thị; giao diện dịch), `None` = xóa được:
+    /// - `bad_path`: hình dạng lạ — tương đối, thiếu `\` sau ổ, UNC (kể cả `\\localhost\C$`), tiền tố thiết bị
+    ///   (`\\.\`, `\\?\GLOBALROOT`, `\\?\Volume{…}`), có `.`/`..`, tên kết thúc bằng `.` hoặc dấu cách (Win32 và
+    ///   `\\?\` hiểu khác nhau), có `:` (luồng dữ liệu) hay ký tự đại diện;
+    /// - `drive_root`, `root_special`, `user_profile_root`, `system_dir`: luật chặn đường gõ vào (xem
+    ///   `is_protected_lexical`);
+    /// - `link_ancestor`: BẤT KỲ thư mục tổ tiên nào (dưới gốc ổ, trên đích) là junction/symlink/mount point,
+    ///   không phải thư mục, hoặc không đọc được thuộc tính. Bộ quét không đi theo link nên nút hợp lệ không bao
+    ///   giờ nằm dưới link; gặp link nghĩa là cây đã bị tráo sau khi quét và lệnh xóa có thể bị dẫn đi nơi khác;
+    /// - `canonical_protected`: đường thật sau `canonicalize` bị luật chặn (bản thân đích là link thì chỉ chặn vì
+    ///   lý do này — xóa link không xóa đích), hoặc `canonicalize` hỏng vì lý do khác «không có».
+    pub fn protect_reason(&self, path: &Path) -> Option<&'static str> {
         let Some(verbatim) = checked_verbatim(path) else {
-            return true;
+            return Some("bad_path");
         };
-        if self.is_protected_lexical(path) || self.is_protected_lexical(&verbatim) {
-            return true;
+        if let Some(r) = self.lexical_reason(path).or_else(|| self.lexical_reason(&verbatim)) {
+            return Some(r);
         }
-        let ancestors_ok = verbatim.ancestors().skip(1).take_while(|a| a.parent().is_some()).all(plain_dir);
-        if !ancestors_ok {
-            return true;
+        if !verbatim.ancestors().skip(1).take_while(|a| a.parent().is_some()).all(plain_dir) {
+            return Some("link_ancestor");
         }
         match std::fs::canonicalize(&verbatim) {
-            Ok(real) => self.is_protected_lexical(&real),
-            Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+            Ok(real) if self.lexical_reason(&real).is_none() => None,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            _ => Some("canonical_protected"),
         }
     }
 
     /// Chỉ so chuỗi (đã chuẩn hóa `..`, `.`, hoa thường, tiền tố `\\?\`/`\\.\`, chấm/cách cuối tên) — không chạm đĩa.
     pub fn is_protected_lexical(&self, path: &Path) -> bool {
+        self.lexical_reason(path).is_some()
+    }
+
+    fn lexical_reason(&self, path: &Path) -> Option<&'static str> {
         let parts = parts(path);
-        // Gốc ổ đĩa ("c:") hoặc gốc chia sẻ UNC.
-        if parts.len() <= 1 {
-            return true;
+        // UNC (kể cả `\\?\UNC\…`, `\\.\UNC\…`): chỉ nhận ổ có chữ cái.
+        if parts.first().is_some_and(|p| p.starts_with(r"\\") || p == "unc") {
+            return Some("bad_path");
         }
-        if ROOT_SPECIAL.contains(&parts[1].as_str()) || parts[1].starts_with('$') {
-            return true;
+        if parts.len() <= 1 {
+            return Some("drive_root");
+        }
+        // Bỏ phần luồng dữ liệu (`$MFT::$DATA`) trước khi so tên.
+        let top = parts[1].split(':').next().unwrap_or_default().trim_end_matches(['.', ' ']);
+        if ROOT_SPECIAL.contains(&top) {
+            return Some("root_special");
         }
         let k = parts.join("\\");
-        if self.user_profiles.contains(&k) {
-            return true;
+        if self.user_profiles.iter().any(|(p, _)| *p == k) {
+            return Some("user_profile_root");
         }
-        if self.user_profiles.iter().any(|p| is_within(&k, p)) {
-            return false;
+        if self.user_profiles.iter().any(|(p, exempt)| *exempt && is_within(&k, p)) {
+            return None;
         }
-        self.system_dirs.iter().any(|d| k == *d || is_within(&k, d))
+        self.system_dirs.iter().any(|d| k == *d || is_within(&k, d)).then_some("system_dir")
     }
+}
+
+/// Hồ sơ (hoặc đường thật của nó) không được là/nằm trong thư mục hệ thống (khóa đã chuẩn hóa).
+fn check_profiles(system_dirs: &[String], profiles: &[String]) -> Result<(), String> {
+    for p in profiles {
+        if let Some(d) = system_dirs.iter().find(|d| p == *d || is_within(p, d)) {
+            return Err(format!("user profile {p} is inside system directory {d}"));
+        }
+    }
+    Ok(())
 }
 
 fn push_unique(v: &mut Vec<String>, k: String) {
@@ -130,8 +202,8 @@ fn key(path: &Path) -> String {
     parts(path).join("\\")
 }
 
-/// Phần đầu là gốc (`c:` hoặc `\\srv\share`), sau đó từng tên: bỏ `\\?\`/`\\.\`, gộp `.`/`..`, chữ thường,
-/// bỏ chấm/cách cuối tên (Win32 tự bỏ khi mở, nên `C:\Windows.` chính là `C:\Windows`).
+/// Phần đầu là gốc (`c:`; UNC giữ dạng `\\srv\share` để bị nhận ra và chặn), sau đó từng tên: bỏ `\\?\`/`\\.\`,
+/// gộp `.`/`..`, chữ thường, bỏ chấm/cách cuối tên (Win32 tự bỏ khi mở, nên `C:\Windows.` chính là `C:\Windows`).
 fn parts(path: &Path) -> Vec<String> {
     let s = path.to_string_lossy();
     let s = if let Some(r) = s.strip_prefix(r"\\?\UNC\") {
@@ -163,16 +235,13 @@ fn parts(path: &Path) -> Vec<String> {
     out
 }
 
-/// Đường dẫn tuyệt đối có ổ đĩa hoặc chia sẻ UNC, chỉ gồm tên thường ⇒ dạng `\\?\` tương ứng (đọc được cả
-/// đường dài hơn 260 ký tự, không để Win32 diễn giải lại). Hình dạng lạ ⇒ `None`.
+/// Đường dẫn tuyệt đối trên ổ có chữ cái, chỉ gồm tên thường ⇒ dạng `\\?\X:\…` (đọc được cả đường dài hơn 260
+/// ký tự, không để Win32 diễn giải lại). Hình dạng lạ hoặc UNC ⇒ `None`.
 fn checked_verbatim(path: &Path) -> Option<PathBuf> {
     let mut comps = path.components();
     let mut out = match comps.next() {
         Some(Component::Prefix(p)) => match p.kind() {
             Prefix::Disk(l) | Prefix::VerbatimDisk(l) => format!(r"\\?\{}:", l as char),
-            Prefix::UNC(srv, share) | Prefix::VerbatimUNC(srv, share) => {
-                format!(r"\\?\UNC\{}\{}", srv.to_str()?, share.to_str()?)
-            }
             _ => return None,
         },
         _ => return None,
@@ -186,7 +255,11 @@ fn checked_verbatim(path: &Path) -> Option<PathBuf> {
             return None;
         };
         let n = n.to_str()?;
-        if n == "." || n == ".." || n.contains([':', '/', '\\', '*', '?', '"', '<', '>', '|']) {
+        if n == "."
+            || n == ".."
+            || n.ends_with(['.', ' '])
+            || n.contains([':', '/', '\\', '*', '?', '"', '<', '>', '|'])
+        {
             return None;
         }
         out.push('\\');
@@ -295,13 +368,91 @@ mod tests {
     }
 
     #[test]
-    fn unc_share_roots_are_drive_roots() {
+    fn only_real_system_names_at_the_drive_root_are_blocked() {
         let r = rules();
-        assert!(r.is_protected_lexical(Path::new(r"\\srv\share")));
-        assert!(r.is_protected_lexical(Path::new(r"\\srv\share\")));
-        assert!(r.is_protected_lexical(Path::new(r"\\?\UNC\srv\share")));
-        assert!(r.is_protected_lexical(Path::new(r"\\srv\share\$Recycle.Bin")));
-        assert!(!r.is_protected_lexical(Path::new(r"\\srv\share\data")));
+        for p in [
+            r"C:\$MFT", r"C:\$MFTMirr", r"C:\$LogFile", r"C:\$Volume", r"C:\$AttrDef", r"C:\$Bitmap", r"C:\$Boot",
+            r"C:\$BadClus", r"C:\$Secure", r"C:\$UpCase", r"C:\$Extend\$Quota", r"C:\$Recycle.Bin", r"C:\$WinREAgent\x",
+            r"C:\bootmgr", r"C:\BOOTNXT", r"C:\Boot\BCD", r"D:\Recovery", r"C:\EFI", r"C:\$MFT::$DATA",
+        ] {
+            assert!(r.is_protected_lexical(Path::new(p)), "{p}");
+            assert!(r.protect_reason(Path::new(p)).is_some(), "{p}");
+        }
+        // Thư mục cập nhật/cài lại Windows để lại ở gốc ổ: dọn được, không phải metafile.
+        for p in [r"C:\$WINDOWS.~BT", r"C:\$Windows.~WS\x", r"C:\$GetCurrent", r"C:\$SysReset", r"D:\data\bootmgr", r"D:\data\Boot"] {
+            assert!(!r.is_protected_lexical(Path::new(p)), "{p}");
+        }
+    }
+
+    #[test]
+    fn unc_paths_are_always_blocked() {
+        let r = rules();
+        for p in [
+            r"\\srv\share",
+            r"\\srv\share\",
+            r"\\srv\share\data",
+            r"\\?\UNC\srv\share\data",
+            r"\\localhost\C$\Users\an\Downloads\x",
+            r"\\?\UNC\127.0.0.1\c$\Users\an\Downloads\x",
+            r"\\.\UNC\srv\share\x",
+        ] {
+            assert!(r.is_protected_lexical(Path::new(p)), "{p}");
+            assert_eq!(r.protect_reason(Path::new(p)), Some("bad_path"), "{p}");
+        }
+    }
+
+    #[test]
+    fn every_block_has_a_reason_code() {
+        let r = rules();
+        let reason = |p: &str| r.protect_reason(Path::new(p));
+        assert_eq!(reason(r"C:\Windows\System32"), Some("system_dir"));
+        assert_eq!(reason(r"C:\Users\Public\x"), Some("system_dir"));
+        assert_eq!(reason(r"C:\Users\an"), Some("user_profile_root"));
+        assert_eq!(reason(r"D:\"), Some("drive_root"));
+        assert_eq!(reason(r"C:\pagefile.sys"), Some("root_special"));
+        assert_eq!(reason(r"C:\Users\an\..\x"), Some("bad_path"));
+        assert_eq!(reason(r"\\srv\share\x"), Some("bad_path"));
+        let f = fake();
+        let link = f.downloads.join("link");
+        junction::create(f.sys.join("System32"), &link).unwrap();
+        assert_eq!(f.rules.protect_reason(&link), Some("canonical_protected"));
+        assert_eq!(f.rules.protect_reason(&link.join("x")), Some("link_ancestor"));
+        assert_eq!(f.rules.protect_reason(&f.downloads), None);
+        assert!(f.rules.is_protected(&link));
+        assert!(!f.rules.is_protected(&f.downloads));
+    }
+
+    #[test]
+    fn a_profile_inside_a_system_dir_is_not_an_exemption() {
+        let r = ProtectRules::new(
+            &[PathBuf::from(r"C:\Windows"), PathBuf::from(r"C:\Users")],
+            Path::new(r"C:\Windows\x\prof"),
+        );
+        assert_eq!(r.protect_reason(Path::new(r"C:\Windows\x\prof\a")), Some("system_dir"));
+        assert_eq!(r.protect_reason(Path::new(r"C:\Windows\x\prof")), Some("user_profile_root"));
+        let sys = [r"c:\windows".to_string()];
+        assert!(check_profiles(&sys, &[r"c:\windows\x\prof".to_string()]).is_err());
+        assert!(check_profiles(&sys, &[r"c:\windows".to_string()]).is_err());
+        assert!(check_profiles(&sys, &[r"c:\users\an".to_string(), r"d:\windows\an".to_string()]).is_ok());
+        assert!(check_profiles(&sys, &[r"c:\users\an".to_string(), r"c:\windows\an".to_string()]).is_err(), "đường thật");
+    }
+
+    #[test]
+    fn names_ending_in_a_dot_or_space_are_blocked() {
+        let f = fake();
+        let profile = f.downloads.parent().unwrap().to_path_buf();
+        // Thư mục thật tên `an.` (chỉ tạo được qua `\\?\`). Win32 hiểu `…\an.\x` là `…\an\x`, còn `\\?\` thì không.
+        let mut odd = std::ffi::OsString::from(r"\\?\");
+        odd.push(profile.as_os_str());
+        odd.push(".");
+        let odd = PathBuf::from(odd);
+        std::fs::create_dir_all(odd.join("x")).unwrap();
+        let mut alias = profile.clone().into_os_string();
+        alias.push(r".\x");
+        assert_eq!(f.rules.protect_reason(Path::new(&alias)), Some("bad_path"));
+        assert_eq!(f.rules.protect_reason(&odd.join("x")), Some("bad_path"));
+        assert_eq!(f.rules.protect_reason(&f.downloads.join("a ")), Some("bad_path"));
+        std::fs::remove_dir_all(&odd).unwrap();
     }
 
     /// Cây giả trong thư mục tạm: `<t>\Windows\System32`, `<t>\Users\an\Downloads`, luật dựng trên đó.
