@@ -1,6 +1,6 @@
 import { Badge, Button, Checkbox } from '@fluentui/react-components';
 import { itemDesc, itemName, levelText, statusText } from './labels';
-import { selectable, visible } from './presets';
+import { checkable, revertOnly, visible } from './presets';
 import { tt } from './strings';
 import type { TweakGroup, TweakView } from './types';
 
@@ -37,7 +37,7 @@ function Row({
   onToggle: () => void;
   onReinstall: () => void;
 }) {
-  const canPick = selectable(t);
+  const canPick = checkable(t);
   return (
     <li className={canPick ? 'tc-row' : 'tc-row tc-row-off'} data-testid={`tweak-${t.id}`}>
       <Checkbox checked={checked} disabled={!canPick || locked} onChange={onToggle} aria-label={itemName(t.id)} />
@@ -51,6 +51,7 @@ function Row({
           )}
         </div>
         <div className="wfu-muted">{itemDesc(t.id)}</div>
+        {revertOnly(t) && <div className="wfu-muted">{tt('tweaks.revertOnly')}</div>}
         {t.errors.map((e, i) => (
           <div key={i} className="tc-row-error">
             {tt('tweaks.readError', { message: e })}

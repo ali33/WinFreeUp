@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { initialTState, reducer, type TAction, type TState } from './reducer';
-import { readResult, report, sample } from './testdata';
+import { readResult, report, sample, tw } from './testdata';
+import type { TweakView } from './types';
 
 const run = (actions: TAction[], from: TState = initialTState) => actions.reduce(reducer, from);
 const loaded = () => run([{ type: 'LOAD_STARTED' }, { type: 'LOADED', data: readResult() }]);
@@ -122,5 +123,18 @@ describe('luồng áp dụng', () => {
     const s = reducer(loaded(), { type: 'LOAD_STARTED' });
     expect(s.reloading).toBe(true);
     expect(reducer(s, { type: 'RUN_STARTED', kind: 'revert', ids: ['app_clipchamp'] })).toBe(s);
+  });
+});
+
+// Lệch có chủ ý (yêu cầu sau rà Task 11): mục chỉ hoàn tác tích được, và đọc lại không bỏ nó khỏi lựa chọn.
+describe('mục chỉ hoàn tác', () => {
+  const data = readResult([...sample(), tw('old_tweak', { status: 'unsupported', reason: 'build_max:19045', has_undo: true } as Partial<TweakView>)]);
+  it('tích được và giữ qua lần đọc lại', () => {
+    let s = run([{ type: 'LOAD_STARTED' }, { type: 'LOADED', data }]);
+    expect(s.selected).not.toContain('old_tweak');
+    s = reducer(s, { type: 'TOGGLE', id: 'old_tweak' });
+    expect(s.selected).toContain('old_tweak');
+    s = run([{ type: 'LOAD_STARTED' }, { type: 'LOADED', data }], s);
+    expect(s.selected).toContain('old_tweak');
   });
 });

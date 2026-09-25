@@ -26,6 +26,7 @@
   "tweaks.caution": "Cân nhắc",
   "tweaks.readError": "Không đọc được: {message}",
   "tweaks.reinstall": "Cài lại từ Store",
+  "tweaks.revertOnly": "Có thể hoàn tác thay đổi WinFreeUp đã làm trước đây",
   "tweaks.allUsers": "Nâng cao: gỡ cho mọi tài khoản và chặn cài lại",
   "tweaks.allUsersWarn": "Khó hoàn tác; bản cập nhật Windows lớn có thể vẫn cài lại một số app.",
   "tweaks.apply": "Áp dụng {count} thay đổi",

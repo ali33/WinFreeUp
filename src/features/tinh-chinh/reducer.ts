@@ -1,5 +1,5 @@
 import type { RestorePointStatus } from '../../api/types';
-import { defaultSelection, needsConfirm, pendingChanges, presetSelection, selectable } from './presets';
+import { checkable, defaultSelection, needsConfirm, pendingChanges, presetSelection } from './presets';
 import type { ReadResult, RunReport, TweakEvent, TweakLevel } from './types';
 
 /**
@@ -83,7 +83,7 @@ export function reducer(s: TState, a: TAction): TState {
       return s.data ? { ...s, reloading: true, loadError: null } : { ...s, phase: 'loading', loadError: null };
     case 'LOADED': {
       const tweaks = a.data.tweaks;
-      const allowed = new Set(tweaks.filter(selectable).map((t) => t.id));
+      const allowed = new Set(tweaks.filter(checkable).map((t) => t.id));
       const selected = s.touched ? s.selected.filter((id) => allowed.has(id)) : defaultSelection(tweaks);
       const phase = s.phase === 'loading' ? 'ready' : s.phase;
       return { ...s, phase, data: a.data, reloading: false, loadError: null, selected };
@@ -94,7 +94,7 @@ export function reducer(s: TState, a: TAction): TState {
     case 'TOGGLE': {
       if (s.phase !== 'ready' || !s.data) return s;
       const t = s.data.tweaks.find((x) => x.id === a.id);
-      if (!t || !selectable(t)) return s;
+      if (!t || !checkable(t)) return s;
       const selected = s.selected.includes(a.id) ? s.selected.filter((x) => x !== a.id) : [...s.selected, a.id];
       return { ...s, selected, touched: true };
     }

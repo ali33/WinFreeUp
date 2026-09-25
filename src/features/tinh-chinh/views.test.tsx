@@ -3,9 +3,9 @@ import { fireEvent, render, screen, waitFor, within } from '@testing-library/rea
 import { FluentProvider, webLightTheme } from '@fluentui/react-components';
 import type { ReactNode } from 'react';
 import { TinhChinhView } from './TinhChinhView';
-import { readResult, report, sample } from './testdata';
+import { readResult, report, sample, tw } from './testdata';
 import { itemName } from './labels';
-import type { RunReport, TweakApi, TweakEvent } from './types';
+import type { RunReport, TweakApi, TweakEvent, TweakView } from './types';
 
 const wrap = (ui: ReactNode) => render(<FluentProvider theme={webLightTheme}>{ui}</FluentProvider>);
 
@@ -235,5 +235,19 @@ describe('TinhChinhView', () => {
     expect(document.activeElement).not.toBe(document.body);
     done();
     await waitFor(() => expect((screen.getByRole('button', { name: 'Đóng' }) as HTMLButtonElement).disabled).toBe(false));
+  });
+
+  // Lệch có chủ ý (yêu cầu sau rà Task 11): mục sai build đã áp dụng trước đó ⇒ tích được để hoàn tác.
+  it('mục chỉ hoàn tác ⇒ nhãn không hỗ trợ kèm dòng hoàn tác được, ô tích bật, nút Hoàn tác đếm nó', async () => {
+    const data = readResult([...sample(), tw('old_tweak', { status: 'unsupported', reason: 'build_max:19045', has_undo: true } as Partial<TweakView>)]);
+    wrap(<TinhChinhView api={fakeApi({ read: vi.fn(async () => data) })} notify={vi.fn()} dryRun={false} />);
+    const row = await screen.findByTestId('tweak-old_tweak');
+    expect(within(row).getByText(/^Không hỗ trợ trên máy này/)).toBeTruthy();
+    expect(within(row).getByText('Có thể hoàn tác thay đổi WinFreeUp đã làm trước đây')).toBeTruthy();
+    const box = within(row).getByRole('checkbox') as HTMLInputElement;
+    expect(box.disabled).toBe(false);
+    fireEvent.click(box);
+    expect(screen.getByRole('button', { name: 'Hoàn tác đã chọn (1)' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Áp dụng 1 thay đổi' })).toBeTruthy();
   });
 });
