@@ -61,6 +61,8 @@
   "result.home": "Về đầu",
 
   "notice.browserRunning": "{name} đang mở — file đang dùng sẽ được bỏ qua. Đóng trình duyệt để dọn sạch hơn.",
+  "notice.rootRejected": "Bỏ qua {path}: thư mục này nằm dưới một liên kết (junction) hoặc ổ ánh xạ, WinFreeUp không dọn ở đó để an toàn.",
+  "notice.rootUnreadable": "Không đọc được {path}, đã bỏ qua thư mục này.",
   "notice.groupFailed": "{name}: {message}",
   "notice.groupErrors": "{name}: {count} lỗi, ví dụ: {first}",
   "notice.logWriteFailed": "Không ghi được đầy đủ nhật ký lượt dọn này.",

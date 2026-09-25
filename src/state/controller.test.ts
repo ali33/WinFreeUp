@@ -74,6 +74,16 @@ describe('khởi động', () => {
     expect(store.getState().freeFailed).toBe(true);
     expect(notify).toHaveBeenCalledWith('warning', 'Không đọc được dung lượng ổ đĩa: The device is not ready.');
   });
+
+  it('gọi khởi động hai lần liền không đợi lần đầu (StrictMode): lõi chỉ vào một lần', async () => {
+    const { d, api } = setup();
+    const p1 = c.loadInitial(d);
+    const p2 = c.loadInitial(d);
+    await p1;
+    await p2;
+    expect(api.appInfo).toHaveBeenCalledTimes(1);
+    expect(api.diskFree).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('quét', () => {
@@ -243,6 +253,27 @@ describe('dọn', () => {
     expect(notify).toHaveBeenCalledWith('warning', 'File tạm của bạn: 1 lỗi, ví dụ: C:\\x: denied');
     expect(notify).toHaveBeenCalledWith('warning', 'Bộ nhớ đệm trình duyệt: panic: boom');
     expect(notify).toHaveBeenCalledWith('warning', 'Không ghi được đầy đủ nhật ký lượt dọn này.');
+  });
+
+  it('lỗi gốc bị loại (root_rejected:) trong CleanReport.errors hiện thành câu tiếng Việt, không lộ mã thô', async () => {
+    const s: CleanSummary = {
+      groups: [
+        {
+          id: 'user_temp',
+          report: { bytes_freed: 0, files_deleted: 0, skipped_locked: 0, errors: ['root_rejected:C:\\Users\\a\\AppData\\Local\\Temp'], dry_run: false },
+          error: null,
+        },
+      ],
+      log_path: 'x',
+      dry_run: false,
+      log_write_failed: false,
+    };
+    const { d, notify } = setup({ clean: vi.fn(async () => s) });
+    await c.startScan(d);
+    await c.requestClean(d);
+    const call = notify.mock.calls.find((args) => args[0] === 'warning' && String(args[1]).includes('File tạm của bạn'));
+    expect(call?.[1]).toContain('C:\\Users\\a\\AppData\\Local\\Temp');
+    expect(call?.[1]).not.toContain('root_rejected:');
   });
 
   it('chế độ chạy thử truyền dryRun=true', async () => {
