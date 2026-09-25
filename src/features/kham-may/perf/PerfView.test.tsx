@@ -193,4 +193,50 @@ describe('Bộ nhớ & Hiệu năng', () => {
     act(() => pushes[1](tick(T0)));
     expect(screen.getByRole('img', { name: 'CPU: 20%' })).toBeTruthy();
   });
+
+  it('bắt đầu đo hỏng khi chưa có mẫu: hiện lỗi nguyên văn thay vòng quay, bấm Thử lại thì chạy lại', async () => {
+    const perfStart = vi.fn().mockRejectedValueOnce('PDH open: 0xC0000BB8').mockResolvedValueOnce([]);
+    const { api } = setup({ perfStart });
+    expect(await screen.findByText('Không bắt đầu đo được: PDH open: 0xC0000BB8')).toBeTruthy();
+    expect(screen.queryByText('Đang bắt đầu đo…')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Thử lại' }));
+    await vi.waitFor(() => expect(api.perfStart).toHaveBeenCalledTimes(2));
+    expect(screen.getByText('Đang bắt đầu đo…')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Thử lại' })).toBeNull();
+  });
+
+  it('lỗi từng mẫu lặp lại thì chỉ báo một lần mỗi thông điệp', async () => {
+    const s = setup();
+    await vi.waitFor(() => expect(s.api.perfStart).toHaveBeenCalled());
+    s.fail('A');
+    s.fail('A');
+    s.fail('B');
+    expect(s.notify.mock.calls.map((c) => c[1])).toEqual(['Lỗi khi lấy mẫu: A', 'Lỗi khi lấy mẫu: B']);
+  });
+
+  it('không lấy được biểu tượng thì hổ phách có câu dẫn, một lần', async () => {
+    const { send, notify } = setup({ appIcon: vi.fn(async () => Promise.reject('Access is denied.')) });
+    await vi.waitFor(() => expect(screen.getByText('Đang bắt đầu đo…')).toBeTruthy());
+    send(tick(T0));
+    await vi.waitFor(() => expect(notify).toHaveBeenCalledWith('warning', 'Không lấy được biểu tượng app: Access is denied.'));
+    expect(notify.mock.calls.filter((c) => c[1].startsWith('Không lấy được biểu tượng'))).toHaveLength(1);
+  });
+
+  it('kết thúc một phần, mở vị trí hỏng, không đo được đĩa: đều lên hổ phách', async () => {
+    const { send, notify } = setup({
+      appKill: vi.fn(async () => ({ killed: 1, errors: ['PID 7: Access is denied.', 'PID 8: x'], log_error: null })),
+      revealPath: vi.fn(async () => Promise.reject('The system cannot find the file specified.')),
+    });
+    await vi.waitFor(() => expect(screen.getByText('Đang bắt đầu đo…')).toBeTruthy());
+    send(tick(T0, { disk_error: 'PDH disk: 0xC0000BB8', sample: { ...tick(T0).sample, disk_active: null } }));
+    expect(notify).toHaveBeenCalledWith('warning', 'Không đo được hoạt động đĩa: PDH disk: 0xC0000BB8');
+    expect(screen.getByRole('img', { name: 'Hoạt động đĩa: Không đo được' })).toBeTruthy();
+    fireEvent.click(within(appRow('Google Chrome')).getByRole('button', { name: 'Mở vị trí file', hidden: true }));
+    await vi.waitFor(() => expect(notify).toHaveBeenCalledWith('warning', 'Không mở được vị trí file: The system cannot find the file specified.'));
+    fireEvent.click(within(appRow('Google Chrome')).getByRole('button', { name: 'Kết thúc app', hidden: true }));
+    fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Kết thúc', hidden: true }));
+    await vi.waitFor(() =>
+      expect(notify).toHaveBeenCalledWith('warning', '«Google Chrome»: 2 tiến trình không kết thúc được, ví dụ: PID 7: Access is denied.'),
+    );
+  });
 });

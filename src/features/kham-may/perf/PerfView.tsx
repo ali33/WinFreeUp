@@ -17,6 +17,10 @@ export function PerfView({ api, notify }: { api: KhamMayApi; notify: Notify }) {
   const [confirm, setConfirm] = useState<AppRow | null>(null);
   const [killing, setKilling] = useState(false);
   const [status, setStatus] = useState('');
+  /** Lần bắt đầu đo hỏng khi chưa có mẫu nào ⇒ hiện lỗi + nút Thử lại thay vòng quay. */
+  const [startError, setStartError] = useState<string | null>(null);
+  /** Tăng để chạy lại effect lấy mẫu (nút Thử lại). */
+  const [attempt, setAttempt] = useState(0);
   const warned = useRef<Set<string>>(new Set());
   const requested = useRef<Set<string>>(new Set());
   const alive = useRef(true);
@@ -31,6 +35,8 @@ export function PerfView({ api, notify }: { api: KhamMayApi; notify: Notify }) {
     alive.current = true;
     // Cờ riêng của lần gắn này: StrictMode gắn → gỡ → gắn lại, mẫu muộn của lần đầu không được lọt vào.
     let active = true;
+    // Lần bắt đầu này đã hỏng thì lõi không chạy lấy mẫu — khi gỡ không cần perfStop.
+    let failed = false;
     const onTick = (t: PerfTick) => {
       if (!active) return;
       setLast(t);
@@ -38,17 +44,24 @@ export function PerfView({ api, notify }: { api: KhamMayApi; notify: Notify }) {
       if (t.net_app_error) warnOnce('net', tk('km.perf.netAppMissing', { message: t.net_app_error }));
       if (t.disk_error) warnOnce('disk', tk('km.perf.diskMissing', { message: t.disk_error }));
     };
-    const onError = (m: string) => active && notify('warning', tk('km.perf.sampleFailed', { message: m }));
+    // Gộp trùng theo thông điệp: lỗi lặp mỗi giây chỉ báo một lần.
+    const onError = (m: string) => active && warnOnce(`sample:${m}`, tk('km.perf.sampleFailed', { message: m }));
     api
       .perfStart(onTick, onError)
       .then((history) => active && setSamples((s) => history.reduce(pushSample, s)))
-      .catch((e) => active && notify('error', tk('km.perf.startFailed', { message: friendly(e) })));
+      .catch((e) => {
+        failed = true;
+        if (!active) return;
+        const message = tk('km.perf.startFailed', { message: friendly(e) });
+        setStartError(message);
+        notify('error', message);
+      });
     return () => {
       active = false;
       alive.current = false;
-      api.perfStop().catch((e) => notify('warning', friendly(e)));
+      if (!failed) api.perfStop().catch((e) => notify('warning', friendly(e)));
     };
-  }, [api, notify]);
+  }, [api, notify, attempt]);
 
   // Biểu tượng app: xin một lần cho mỗi đường dẫn, lõi nhớ đệm.
   useEffect(() => {
@@ -63,7 +76,7 @@ export function PerfView({ api, notify }: { api: KhamMayApi; notify: Notify }) {
           if (!alive.current) return;
           setIcons((m) => ({ ...m, [p]: null }));
           // Thiếu biểu tượng không chặn việc đọc bảng ⇒ hổ phách, báo một lần.
-          warnOnce('icon', friendly(e));
+          warnOnce('icon', tk('km.perf.iconFailed', { message: friendly(e) }));
         });
     }
   }, [api, last]);
@@ -93,7 +106,24 @@ export function PerfView({ api, notify }: { api: KhamMayApi; notify: Notify }) {
     }
   }
 
-  if (!last) return <Spin label={tk('km.perf.starting')} />;
+  if (!last) {
+    if (startError === null) return <Spin label={tk('km.perf.starting')} />;
+    return (
+      <section className="km-root" aria-label={tk('km.tab.perf')}>
+        <p role="alert">{startError}</p>
+        <Button
+          appearance="primary"
+          onClick={() => {
+            // Xoá lỗi trước ⇒ nút biến mất, vòng quay hiện lại: không bấm chồng được.
+            setStartError(null);
+            setAttempt((n) => n + 1);
+          }}
+        >
+          {tk('km.common.retry')}
+        </Button>
+      </section>
+    );
+  }
 
   const s = last.sample;
   const now = s.t_ms;
