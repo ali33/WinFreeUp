@@ -33,12 +33,14 @@ pub struct Pdh {
 #[derive(Debug, Clone, Copy)]
 pub struct Counter(PDH_HCOUNTER);
 
-// PDH_HQUERY là con trỏ thô; truy vấn chỉ dùng trên một luồng tại một thời điểm (luồng lấy mẫu).
+// SAFETY: PDH_HQUERY là con trỏ thô tới handle PDH, không gắn với luồng tạo ra nó; `Pdh` không `Sync`
+// nên chỉ một luồng dùng truy vấn tại một thời điểm (luồng lấy mẫu).
 unsafe impl Send for Pdh {}
 
 impl Pdh {
     pub fn open() -> Result<Pdh> {
         let mut q: PDH_HQUERY = std::ptr::null_mut();
+        // SAFETY: nguồn dữ liệu null = bộ đếm thời gian thực; `q` là biến cục bộ hợp lệ để PDH ghi handle vào.
         let rc = unsafe { windows_sys::Win32::System::Performance::PdhOpenQueryW(std::ptr::null(), 0, &mut q) };
         if rc != 0 {
             return Err(pdh_err("open", rc));
@@ -49,6 +51,8 @@ impl Pdh {
     pub fn add(&self, path: &str) -> Result<Counter> {
         let w = wide(path);
         let mut c: PDH_HCOUNTER = std::ptr::null_mut();
+        // SAFETY: `self.query` là handle mở bởi PdhOpenQueryW, sống tới Drop; `w` là chuỗi UTF-16 kết thúc NUL
+        // (util::wide) còn sống suốt lời gọi; `c` là biến cục bộ hợp lệ để ghi handle bộ đếm.
         let rc = unsafe { PdhAddEnglishCounterW(self.query, w.as_ptr(), 0, &mut c) };
         if rc != 0 {
             return Err(pdh_err(path, rc));
@@ -57,6 +61,7 @@ impl Pdh {
     }
 
     pub fn collect(&self) -> Result<()> {
+        // SAFETY: `self.query` là handle hợp lệ (mở ở `open`, chỉ đóng ở Drop).
         let rc = unsafe { PdhCollectQueryData(self.query) };
         if rc != 0 {
             return Err(pdh_err("collect", rc));
@@ -67,16 +72,20 @@ impl Pdh {
     /// Giá trị đã định dạng; `None` khi chưa đủ hai lần thu (bộ đếm tốc độ) hoặc dữ liệu không hợp lệ.
     pub fn value(&self, c: Counter) -> Option<f64> {
         let mut v = PDH_FMT_COUNTERVALUE::default();
+        // SAFETY: `c.0` là handle bộ đếm thêm vào truy vấn này (còn sống vì truy vấn chưa đóng); lpdwType null được phép;
+        // `v` là biến cục bộ đủ kích thước PDH_FMT_COUNTERVALUE.
         let rc = unsafe { PdhGetFormattedCounterValue(c.0, PDH_FMT_DOUBLE | PDH_FMT_NOCAP100, std::ptr::null_mut(), &mut v) };
         if rc != 0 || !(v.CStatus == PDH_CSTATUS_VALID_DATA || v.CStatus == PDH_CSTATUS_NEW_DATA) {
             return None;
         }
+        // SAFETY: đã yêu cầu PDH_FMT_DOUBLE và lời gọi thành công với dữ liệu hợp lệ ⇒ trường đang dùng là doubleValue.
         Some(unsafe { v.Anonymous.doubleValue })
     }
 }
 
 impl Drop for Pdh {
     fn drop(&mut self) {
+        // SAFETY: đóng đúng một lần handle mở ở `open`; không còn dùng sau Drop (Counter chỉ đọc qua &Pdh).
         unsafe { PdhCloseQuery(self.query) };
     }
 }
@@ -99,6 +108,7 @@ pub struct CpuDiskCounters {
     pub disk_error: Option<String>,
 }
 
+// SAFETY: chỉ chứa `Pdh` (Send, xem trên) và handle bộ đếm thuộc chính truy vấn đó; không `Sync`.
 unsafe impl Send for CpuDiskCounters {}
 
 impl CpuDiskCounters {
@@ -140,6 +150,7 @@ pub struct MemoryStatus {
 
 pub fn memory() -> Result<MemoryStatus> {
     let mut m = MEMORYSTATUSEX { dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32, ..Default::default() };
+    // SAFETY: `m` là biến cục bộ với dwLength đã đặt đúng kích thước như API yêu cầu.
     if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
         return Err(CoreError::System(format!("GlobalMemoryStatusEx: {}", std::io::Error::last_os_error())));
     }
@@ -156,19 +167,23 @@ pub fn memory() -> Result<MemoryStatus> {
 /// Bỏ loopback và card ảo (Hyper-V, VPN…) để lưu lượng không bị đếm hai lần.
 pub fn net_totals() -> Result<(u64, u64)> {
     let mut table: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
+    // SAFETY: `table` là biến cục bộ để API ghi con trỏ tới bảng do nó cấp phát (giải phóng bằng FreeMibTable bên dưới).
     let rc = unsafe { GetIfTable2(&mut table) };
     if rc != 0 {
         return Err(CoreError::System(format!("GetIfTable2: {}", std::io::Error::from_raw_os_error(rc as i32))));
     }
     let (mut rx, mut tx) = (0u64, 0u64);
+    // SAFETY: GetIfTable2 thành công ⇒ `table` trỏ tới MIB_IF_TABLE2 hợp lệ có NumEntries dòng liền nhau bắt đầu ở
+    // `Table`; lát cắt chỉ dùng trước FreeMibTable, và bảng được giải phóng đúng một lần.
     unsafe {
         let n = (*table).NumEntries as usize;
         let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), n);
         for r in rows {
             let hardware = r.InterfaceAndOperStatusFlags._bitfield & 1 != 0;
             if hardware && r.Type != IF_TYPE_SOFTWARE_LOOPBACK && r.OperStatus == IF_OPER_STATUS_UP {
-                rx += r.InOctets;
-                tx += r.OutOctets;
+                // Tổng tích lũy 64-bit của nhiều card: chặn trần thay vì tràn (bản debug sẽ panic khi tràn).
+                rx = rx.saturating_add(r.InOctets);
+                tx = tx.saturating_add(r.OutOctets);
             }
         }
         FreeMibTable(table.cast());
