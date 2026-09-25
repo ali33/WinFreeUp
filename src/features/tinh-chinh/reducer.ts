@@ -108,7 +108,9 @@ export function reducer(s: TState, a: TAction): TState {
       if (s.phase !== 'ready' || !s.data || s.reloading) return s;
       const ids = pendingChanges(s.data.tweaks, s.selected);
       if (ids.length === 0) return s;
-      return needsConfirm(s.data.tweaks, ids, s.allUsers).length > 0 ? { ...s, phase: 'confirm' } : { ...s, phase: 'restorePoint', restore: null };
+      // Chạy bằng tài khoản admin khác ⇒ luôn hỏi lại (mục theo tài khoản sẽ áp cho tài khoản admin đó).
+      const ask = s.data.system.other_user || needsConfirm(s.data.tweaks, ids, s.allUsers).length > 0;
+      return ask ? { ...s, phase: 'confirm' } : { ...s, phase: 'restorePoint', restore: null };
     }
     case 'CONFIRM_ACCEPTED':
       return s.phase === 'confirm' ? { ...s, phase: 'restorePoint', restore: null } : s;

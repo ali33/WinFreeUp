@@ -87,6 +87,13 @@ describe('luồng áp dụng', () => {
     expect(s.phase).toBe('confirm');
   });
 
+  // Lệch có chủ ý (rà Task 11, L3): chạy bằng tài khoản admin khác ⇒ luôn hỏi lại trước khi áp dụng.
+  it('chạy bằng tài khoản admin khác ⇒ luôn hỏi trước', () => {
+    const data = readResult(undefined, { system: { build: 26200, edition: 'Pro', managed: false, other_user: true } });
+    const s = run([{ type: 'LOAD_STARTED' }, { type: 'LOADED', data }, { type: 'REQUEST_APPLY' }]);
+    expect(s.phase).toBe('confirm');
+  });
+
   it('không tạo được điểm khôi phục ⇒ chờ người dùng chọn tiếp hay dừng', () => {
     let s = run([{ type: 'REQUEST_APPLY' }, { type: 'RESTORE_RESULT', status: { status: 'failed', message: 'System Protection is off' } }], loaded());
     expect(s.phase).toBe('restorePoint');

@@ -11,7 +11,7 @@ import {
   MessageBarBody,
   MessageBarTitle,
 } from '@fluentui/react-components';
-import { Busy } from '../../components/Busy';
+import { useEffect, useRef } from 'react';
 import { itemName } from './labels';
 import { needsConfirm, pendingChanges } from './presets';
 import type { TState } from './reducer';
@@ -22,13 +22,16 @@ export function ConfirmTweaks({ state, onAccept, onCancel }: { state: TState; on
   const tweaks = state.data?.tweaks ?? [];
   const list = needsConfirm(tweaks, pendingChanges(tweaks, state.selected), state.allUsers);
   const caution = list.filter((t) => t.risk === 'caution');
-  const apps = state.allUsers ? list.filter((t) => t.group === 'bloatware') : [];
+  // App đã có trong danh sách Cân nhắc thì không lặp lại ở danh sách app.
+  const apps = state.allUsers ? list.filter((t) => t.group === 'bloatware' && t.risk !== 'caution') : [];
+  const allUsersApps = state.allUsers && list.some((t) => t.group === 'bloatware');
   return (
     <Dialog open modalType="alert" onOpenChange={(_, d) => !d.open && onCancel()}>
       <DialogSurface>
         <DialogBody>
           <DialogTitle>{tt('tweaks.confirm.title')}</DialogTitle>
           <DialogContent>
+            {state.data?.system.other_user && <p className="tc-warn">⚠ {tt('tweaks.otherUser')}</p>}
             {caution.length > 0 && (
               <>
                 <p>{tt('tweaks.confirm.caution')}</p>
@@ -39,14 +42,16 @@ export function ConfirmTweaks({ state, onAccept, onCancel }: { state: TState; on
                 </ul>
               </>
             )}
-            {apps.length > 0 && (
+            {allUsersApps && (
               <>
                 <p className="tc-warn">⚠ {tt('tweaks.confirm.allUsers')}</p>
-                <ul>
-                  {apps.map((t) => (
-                    <li key={t.id}>{itemName(t.id)}</li>
-                  ))}
-                </ul>
+                {apps.length > 0 && (
+                  <ul>
+                    {apps.map((t) => (
+                      <li key={t.id}>{itemName(t.id)}</li>
+                    ))}
+                  </ul>
+                )}
               </>
             )}
           </DialogContent>
@@ -64,12 +69,21 @@ export function ConfirmTweaks({ state, onAccept, onCancel }: { state: TState; on
   );
 }
 
-/** Đang tạo điểm khôi phục ⇒ vòng quay; hỏng ⇒ băng hổ phách, người dùng chọn tiếp/dừng. */
+/**
+ * Hỏng tạo điểm khôi phục ⇒ băng hổ phách, người dùng chọn tiếp/dừng; cuộn tới và đặt focus vào băng.
+ * Vòng quay «đang tạo» nằm ở chân trang (TinhChinhView), cạnh nút, để không trôi khỏi khung nhìn.
+ */
 export function RestorePrompt({ state, onContinue, onAbort }: { state: TState; onContinue: () => void; onAbort: () => void }) {
-  if (state.phase !== 'restorePoint') return null;
-  if (state.restore?.status !== 'failed') return <Busy label={tt('tweaks.restore.creating')} size="small" />;
+  const ref = useRef<HTMLDivElement>(null);
+  const failed = state.phase === 'restorePoint' && state.restore?.status === 'failed';
+  useEffect(() => {
+    if (!failed || !ref.current) return;
+    ref.current.scrollIntoView?.({ block: 'nearest' });
+    ref.current.focus();
+  }, [failed]);
+  if (!failed || state.restore?.status !== 'failed') return null;
   return (
-    <MessageBar intent="warning" className="wfu-canhbao">
+    <MessageBar intent="warning" className="wfu-canhbao" ref={ref} tabIndex={-1}>
       <MessageBarBody>
         <MessageBarTitle>{tt('tweaks.restore.failedTitle')}</MessageBarTitle>
         {tt('tweaks.restore.failedBody', { message: state.restore.message })}

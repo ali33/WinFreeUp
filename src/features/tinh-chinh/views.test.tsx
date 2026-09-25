@@ -4,7 +4,8 @@ import { FluentProvider, webLightTheme } from '@fluentui/react-components';
 import type { ReactNode } from 'react';
 import { TinhChinhView } from './TinhChinhView';
 import { readResult, report, sample } from './testdata';
-import type { RunReport, TweakApi } from './types';
+import { itemName } from './labels';
+import type { RunReport, TweakApi, TweakEvent } from './types';
 
 const wrap = (ui: ReactNode) => render(<FluentProvider theme={webLightTheme}>{ui}</FluentProvider>);
 
@@ -109,6 +110,9 @@ describe('TinhChinhView', () => {
     wrap(<TinhChinhView api={fakeApi()} notify={vi.fn()} dryRun />);
     expect(await screen.findByText('Chạy thử: tab này chỉ xem trạng thái, không áp dụng hay hoàn tác.')).toBeTruthy();
     expect((screen.getByRole('button', { name: 'Áp dụng 1 thay đổi' }) as HTMLButtonElement).disabled).toBe(true);
+    const row = screen.getByTestId('tweak-app_clipchamp');
+    expect((within(row).getByRole('button', { name: 'Cài lại từ Store' }) as HTMLButtonElement).disabled).toBe(true);
+    expect((within(screen.getByTestId('tweak-ads_id')).getByRole('checkbox') as HTMLInputElement).disabled).toBe(false);
   });
 
   it('chạy bằng tài khoản admin khác ⇒ băng hổ phách cảnh báo', async () => {
@@ -126,12 +130,110 @@ describe('TinhChinhView', () => {
     expect(await screen.findByText('Quyền riêng tư & quảng cáo')).toBeTruthy();
   });
 
-  it('đọc lại sau khi chạy hỏng ⇒ màn không trống: hiện lỗi nguyên văn và nút Đọc lại', async () => {
+  it('đọc lại sau khi chạy hỏng ⇒ vẫn giữ bảng kết quả, hiện lỗi nguyên văn và nút Đọc lại', async () => {
     const read = vi.fn().mockResolvedValueOnce(readResult()).mockRejectedValueOnce('Access is denied.').mockResolvedValue(readResult());
     wrap(<TinhChinhView api={fakeApi({ read })} notify={vi.fn()} dryRun={false} />);
     fireEvent.click(await screen.findByRole('button', { name: 'Áp dụng 1 thay đổi' }));
     expect(await screen.findByText('Không đọc được trạng thái máy: Access is denied.')).toBeTruthy();
+    expect(screen.getByText('Kết quả')).toBeTruthy();
+    expect(screen.getByText('✓ Xong')).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: 'Đọc lại' }));
     expect(await screen.findByText('Quyền riêng tư & quảng cáo')).toBeTruthy();
+  });
+
+  // Rà Task 11 (HIGH): chỉ báo phải nằm cạnh nút ở chân trang dính, không trôi khỏi khung nhìn khi cuộn.
+  it('đang tạo điểm khôi phục ⇒ vòng quay trong chân trang, cạnh nút', async () => {
+    const api = fakeApi({ prepareRestorePoint: vi.fn(() => new Promise<never>(() => {})) });
+    const { container } = wrap(<TinhChinhView api={api} notify={vi.fn()} dryRun={false} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Áp dụng 1 thay đổi' }));
+    const footer = container.querySelector('.tc-footer') as HTMLElement;
+    expect(await within(footer).findByRole('progressbar')).toBeTruthy();
+    expect(within(footer).getByText('Đang tạo điểm khôi phục hệ thống…')).toBeTruthy();
+  });
+
+  it('đang chạy ⇒ tiến độ «i/n tên mục» trong chân trang', async () => {
+    const api = fakeApi({
+      apply: vi.fn((_ids: string[], _all: boolean, onEvent: (e: TweakEvent) => void) => {
+        onEvent({ kind: 'started', id: 'ads_id', index: 0, total: 1 });
+        return new Promise<RunReport>(() => {});
+      }),
+    });
+    const { container } = wrap(<TinhChinhView api={api} notify={vi.fn()} dryRun={false} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Áp dụng 1 thay đổi' }));
+    const footer = container.querySelector('.tc-footer') as HTMLElement;
+    expect(await within(footer).findByText(`Đang áp dụng 0/1… ${itemName('ads_id')}`)).toBeTruthy();
+    expect(within(footer).getByRole('progressbar')).toBeTruthy();
+  });
+
+  it('không tạo được điểm khôi phục ⇒ băng hổ phách, chọn Vẫn áp dụng hoặc Dừng lại', async () => {
+    const api = fakeApi({ prepareRestorePoint: vi.fn(async () => ({ status: 'failed' as const, message: 'System Protection is off' })) });
+    wrap(<TinhChinhView api={api} notify={vi.fn()} dryRun={false} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Áp dụng 1 thay đổi' }));
+    expect(await screen.findByText('Không tạo được điểm khôi phục')).toBeTruthy();
+    expect(screen.getByText(/System Protection is off/)).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Dừng lại' }));
+    expect(screen.queryByText('Không tạo được điểm khôi phục')).toBeNull();
+    expect(api.apply).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Áp dụng 1 thay đổi' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Vẫn áp dụng' }));
+    expect(await screen.findByText('Kết quả')).toBeTruthy();
+    expect(api.apply).toHaveBeenCalledTimes(1);
+  });
+
+  it('đọc lại ⇒ phủ mờ, có vòng quay, danh sách cũ vẫn còn', async () => {
+    const read = vi.fn().mockResolvedValueOnce(readResult()).mockReturnValue(new Promise(() => {}));
+    const { container } = wrap(<TinhChinhView api={fakeApi({ read })} notify={vi.fn()} dryRun={false} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Áp dụng 1 thay đổi' }));
+    expect(await screen.findByText('Kết quả')).toBeTruthy();
+    await waitFor(() => expect(container.querySelector('.tc-dim')).toBeTruthy());
+    expect(within(container.querySelector('.tc-dim') as HTMLElement).getAllByRole('progressbar').length).toBeGreaterThan(0);
+    expect(within(container.querySelector('.tc-footer') as HTMLElement).getByRole('progressbar')).toBeTruthy();
+    expect(screen.getByText('Quyền riêng tư & quảng cáo')).toBeTruthy();
+    expect(screen.getByTestId('tweak-ads_id')).toBeTruthy();
+  });
+
+  it('«mọi tài khoản» ⇒ ô tích có cảnh báo; hộp xác nhận liệt kê app, không lặp app đã ở mục Cân nhắc', async () => {
+    wrap(<TinhChinhView api={fakeApi()} notify={vi.fn()} dryRun={false} />);
+    const box = await screen.findByRole('checkbox', { name: /Nâng cao: gỡ cho mọi tài khoản/ });
+    expect(screen.getByText(/Khó hoàn tác; bản cập nhật Windows lớn/)).toBeTruthy();
+    fireEvent.click(box);
+    fireEvent.click(screen.getByRole('button', { name: 'Triệt để' }));
+    fireEvent.click(screen.getByRole('button', { name: /^Áp dụng \d+ thay đổi$/ }));
+    const dialog = await screen.findByRole('alertdialog');
+    expect(within(dialog).getByText(/Gỡ cho mọi tài khoản và chặn cài lại/)).toBeTruthy();
+    expect(within(dialog).getByText(itemName('app_weather'))).toBeTruthy();
+    expect(within(dialog).getAllByText(itemName('app_game_bar'))).toHaveLength(1);
+  });
+
+  it('chạy bằng tài khoản admin khác ⇒ luôn hỏi lại, hộp xác nhận nhắc cảnh báo', async () => {
+    const data = readResult(sample(), { system: { build: 26200, edition: 'Pro', managed: false, other_user: true } });
+    wrap(<TinhChinhView api={fakeApi({ read: vi.fn(async () => data) })} notify={vi.fn()} dryRun={false} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Áp dụng 1 thay đổi' }));
+    const dialog = await screen.findByRole('alertdialog');
+    expect(within(dialog).getByText(/tài khoản quản trị khác/)).toBeTruthy();
+  });
+
+  it.each([
+    ['logoff', 'Đăng xuất rồi đăng nhập lại để hoàn tất.'],
+    ['reboot', 'Khởi động lại máy để hoàn tất.'],
+  ] as const)('cần %s ⇒ có lời nhắc', async (restart, text) => {
+    wrap(<TinhChinhView api={fakeApi({ apply: vi.fn(async () => report({ restart })) })} notify={vi.fn()} dryRun={false} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Áp dụng 1 thay đổi' }));
+    expect(await screen.findByText(text)).toBeTruthy();
+  });
+
+  it('đang khởi động lại Explorer ⇒ vòng quay, nút Đóng khoá, focus không rơi về body', async () => {
+    let done: () => void = () => {};
+    const api = fakeApi({ restartExplorer: vi.fn(() => new Promise<void>((r) => (done = r))) });
+    wrap(<TinhChinhView api={api} notify={vi.fn()} dryRun={false} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Áp dụng 1 thay đổi' }));
+    const btn = await screen.findByRole('button', { name: 'Khởi động lại Explorer' });
+    btn.focus();
+    fireEvent.click(btn);
+    expect(await screen.findByText('Đang khởi động lại Explorer…')).toBeTruthy();
+    expect((screen.getByRole('button', { name: 'Đóng' }) as HTMLButtonElement).disabled).toBe(true);
+    expect(document.activeElement).not.toBe(document.body);
+    done();
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Đóng' }) as HTMLButtonElement).disabled).toBe(false));
   });
 });

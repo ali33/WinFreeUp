@@ -6,7 +6,7 @@ import * as c from './controller';
 import { ConfirmTweaks, RestorePrompt } from './Dialogs';
 import { currentPreset, LEVELS, pendingChanges, revertable } from './presets';
 import { initialTState, reducer } from './reducer';
-import { RunPanel } from './RunPanel';
+import { RunPanel, runLabel } from './RunPanel';
 import { tt } from './strings';
 import { TweakList } from './TweakList';
 import type { TweakApi } from './types';
@@ -36,11 +36,15 @@ export function TinhChinhView({ api, notify, dryRun, onBusyChange }: TinhChinhPr
     p.catch((e) => notify('error', c.friendlyT(e)));
   };
 
+  const runPanel = <RunPanel state={s} onRestartExplorer={() => c.restartExplorer(d)} onClose={() => c.dismissResult(d)} />;
+
   if (!s.data) {
     if (!s.loadError) return <Busy label={tt('tweaks.loading')} size="medium" />;
     // Băng đỏ đã lên qua notify (có thể bị người dùng đóng); vẫn ghi lỗi nguyên văn tại chỗ để màn không trống.
+    // Đọc lại hỏng sau một lượt chạy ⇒ giữ bảng kết quả (lỗi từng mục vẫn cần đọc được).
     return (
       <div className="tc-root">
+        {runPanel}
         <div className="tc-row-error">{tt('tweaks.errors.loadFailed', { message: s.loadError })}</div>
         <div className="wfu-actions">
           <Button onClick={() => run(c.load(d))}>{tt('tweaks.retry')}</Button>
@@ -55,6 +59,11 @@ export function TinhChinhView({ api, notify, dryRun, onBusyChange }: TinhChinhPr
   const preset = currentPreset(tweaks, s.selected);
   const toApply = pendingChanges(tweaks, s.selected).length;
   const toRevert = revertable(tweaks, s.selected).length;
+  // Chỉ báo ở chân trang dính, cạnh nút: luôn trong khung nhìn dù người dùng cuộn tới đâu.
+  const status =
+    s.phase === 'restorePoint' && s.restore === null
+      ? tt('tweaks.restore.creating')
+      : (runLabel(s) ?? (s.reloading ? tt('tweaks.reloading') : null));
 
   return (
     <div className="tc-root">
@@ -84,7 +93,7 @@ export function TinhChinhView({ api, notify, dryRun, onBusyChange }: TinhChinhPr
       </div>
 
       <RestorePrompt state={s} onContinue={() => run(c.continueAfterRestoreFailure(d))} onAbort={() => c.abortAfterRestoreFailure(d)} />
-      <RunPanel state={s} onRestartExplorer={() => c.restartExplorer(d)} onClose={() => c.dismissResult(d)} />
+      {runPanel}
 
       <div className={s.reloading ? 'tc-list tc-dim' : 'tc-list'} aria-busy={s.reloading}>
         {s.reloading && (
@@ -92,7 +101,7 @@ export function TinhChinhView({ api, notify, dryRun, onBusyChange }: TinhChinhPr
             <Busy label={tt('tweaks.reloading')} size="small" />
           </div>
         )}
-        <TweakList tweaks={tweaks} selected={s.selected} locked={busy} onToggle={(id) => c.toggle(d, id)} onReinstall={(id) => run(c.reinstall(d, id))} />
+        <TweakList tweaks={tweaks} selected={s.selected} locked={busy} runLocked={locked} onToggle={(id) => c.toggle(d, id)} onReinstall={(id) => run(c.reinstall(d, id))} />
       </div>
 
       <div className="tc-footer">
@@ -107,6 +116,9 @@ export function TinhChinhView({ api, notify, dryRun, onBusyChange }: TinhChinhPr
           }
         />
         <div className="wfu-actions">
+          <div className="tc-footer-status" aria-live="polite">
+            {status && <Busy label={status} size="small" />}
+          </div>
           <Button disabled={locked || toRevert === 0} onClick={() => run(c.revertSelected(d))}>
             {tt('tweaks.revert', { count: toRevert })}
           </Button>

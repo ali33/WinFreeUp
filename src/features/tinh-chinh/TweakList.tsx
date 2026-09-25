@@ -9,6 +9,8 @@ interface ListProps {
   selected: string[];
   /** Đang chạy/đọc lại ⇒ khoá mọi ô và nút. */
   locked: boolean;
+  /** Không được đổi máy (đang bận hoặc chạy thử) ⇒ khoá nút «Cài lại từ Store»; ô tích vẫn theo `locked`. */
+  runLocked: boolean;
   onToggle: (id: string) => void;
   onReinstall: (id: string) => void;
 }
@@ -20,7 +22,21 @@ function statusColor(t: TweakView): 'success' | 'warning' | 'informative' | 'sub
   return 'informative';
 }
 
-function Row({ t, checked, locked, onToggle, onReinstall }: { t: TweakView; checked: boolean; locked: boolean; onToggle: () => void; onReinstall: () => void }) {
+function Row({
+  t,
+  checked,
+  locked,
+  runLocked,
+  onToggle,
+  onReinstall,
+}: {
+  t: TweakView;
+  checked: boolean;
+  locked: boolean;
+  runLocked: boolean;
+  onToggle: () => void;
+  onReinstall: () => void;
+}) {
   const canPick = selectable(t);
   return (
     <li className={canPick ? 'tc-row' : 'tc-row tc-row-off'} data-testid={`tweak-${t.id}`}>
@@ -35,8 +51,8 @@ function Row({ t, checked, locked, onToggle, onReinstall }: { t: TweakView; chec
           )}
         </div>
         <div className="wfu-muted">{itemDesc(t.id)}</div>
-        {t.errors.map((e) => (
-          <div key={e} className="tc-row-error">
+        {t.errors.map((e, i) => (
+          <div key={i} className="tc-row-error">
             {tt('tweaks.readError', { message: e })}
           </div>
         ))}
@@ -46,7 +62,7 @@ function Row({ t, checked, locked, onToggle, onReinstall }: { t: TweakView; chec
         {statusText(t)}
       </Badge>
       {t.group === 'bloatware' && t.status === 'applied' && t.has_undo ? (
-        <Button size="small" disabled={locked} onClick={onReinstall}>
+        <Button size="small" disabled={runLocked} onClick={onReinstall}>
           {tt('tweaks.reinstall')}
         </Button>
       ) : (
@@ -65,7 +81,7 @@ function Section({ group, title, ...p }: ListProps & { group: TweakGroup; title:
       <h3 className="tc-section-title">{title}</h3>
       <ul className="tc-rows">
         {rows.map((t) => (
-          <Row key={t.id} t={t} checked={chosen.has(t.id)} locked={p.locked} onToggle={() => p.onToggle(t.id)} onReinstall={() => p.onReinstall(t.id)} />
+          <Row key={t.id} t={t} checked={chosen.has(t.id)} locked={p.locked} runLocked={p.runLocked} onToggle={() => p.onToggle(t.id)} onReinstall={() => p.onReinstall(t.id)} />
         ))}
       </ul>
     </section>

@@ -106,6 +106,12 @@
   z-index: 1;
 }
 
+/* Vòng quay đọc lại luôn ở giữa khung nhìn, không kẹt ở đầu danh sách dài. */
+.tc-overlay > .wfu-busy {
+  position: sticky;
+  top: 40vh;
+}
+
 .tc-panel {
   display: grid;
   gap: 8px;
@@ -124,7 +130,20 @@
   position: sticky;
   bottom: 0;
   padding: 8px 0;
-  background: inherit;
+  background: var(--colorNeutralBackground1);
+  z-index: 2;
+}
+
+.tc-footer-status {
+  display: flex;
+  align-items: center;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.tc-panel:focus {
+  outline: 2px solid var(--colorStrokeFocus2);
+  outline-offset: 2px;
 }
 
 @media (prefers-color-scheme: dark) {
