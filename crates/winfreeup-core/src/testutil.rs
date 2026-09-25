@@ -1,9 +1,15 @@
 //! Công cụ test: hệ thống giả và cây thư mục giả. Không bao giờ chạm hệ thống thật.
 #![allow(dead_code)]
 use std::fs;
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
+
+use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, SetFileTime, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, OPEN_EXISTING,
+};
 
 use crate::env::{Env, SystemOps};
 use crate::error::{CoreError, Result};
@@ -103,10 +109,38 @@ pub fn write_file(path: &Path, len: usize) -> PathBuf {
     path.to_path_buf()
 }
 
-/// Đặt giờ sửa đổi của file/thư mục lùi về `hours` giờ trước.
+/// Đặt CẢ giờ sửa đổi (mtime) lẫn giờ tạo (creation time) của file/thư mục lùi về `hours` giờ
+/// trước. `fsclean::found()` tính tuổi theo thời điểm MỚI HƠN giữa hai mốc này (bộ cài bung file
+/// vào %TEMP% giữ mtime cũ trong gói nhưng creation time là lúc vừa bung ⇒ không tính là cũ), nên
+/// muốn mô phỏng "file thật sự cũ" trong test phải lùi cả hai, không chỉ mtime.
 pub fn age(path: &Path, hours: u64) {
     let t = SystemTime::now() - Duration::from_secs(hours * 3600);
     filetime::set_file_mtime(path, filetime::FileTime::from_system_time(t)).unwrap();
+    set_created(path, t);
+}
+
+/// Đặt creation time qua `SetFileTime` (Windows không có API chuẩn nào khác cho việc này).
+fn set_created(path: &Path, t: SystemTime) {
+    let dur = t.duration_since(SystemTime::UNIX_EPOCH).unwrap();
+    let ticks = dur.as_secs() * 10_000_000 + u64::from(dur.subsec_nanos()) / 100 + 116_444_736_000_000_000;
+    let ft = FILETIME { dwLowDateTime: (ticks & 0xFFFF_FFFF) as u32, dwHighDateTime: (ticks >> 32) as u32 };
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    unsafe {
+        let handle = CreateFileW(
+            wide.as_ptr(),
+            FILE_WRITE_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        );
+        assert!(handle != INVALID_HANDLE_VALUE, "CreateFileW({}) failed: {}", path.display(), std::io::Error::last_os_error());
+        let ok = SetFileTime(handle, &ft, std::ptr::null(), std::ptr::null());
+        let err = std::io::Error::last_os_error();
+        CloseHandle(handle);
+        assert!(ok != 0, "SetFileTime({}) failed: {err}", path.display());
+    }
 }
 
 #[derive(Default)]
