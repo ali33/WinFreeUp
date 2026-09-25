@@ -17,6 +17,13 @@
   "km.err.recycleDisabled": "Thùng rác của ổ này đang bị tắt — xóa sẽ mất hẳn nên WinFreeUp không xóa. Hãy xóa trong Explorer.",
   "km.err.onedrive": "Mục này nằm trong OneDrive — xóa ở đây sẽ xóa luôn trên đám mây và mọi máy đồng bộ. Hãy xóa trong OneDrive hoặc Explorer.",
   "km.common.retry": "Thử lại",
+  "km.protect.system_dir": "Đây là thư mục của Windows hoặc của chương trình — xóa sẽ làm hỏng máy hoặc app, nên không xóa được.",
+  "km.protect.user_profile_root": "Đây là thư mục người dùng — chỉ xóa được các mục bên trong, không xóa được chính nó.",
+  "km.protect.drive_root": "Đây là gốc ổ đĩa — không xóa được.",
+  "km.protect.root_special": "Đây là mục hệ thống ở gốc ổ (bộ nhớ ảo, khởi động, khôi phục, Thùng rác…) — không xóa được.",
+  "km.protect.link_ancestor": "Đường đi tới mục này có liên kết (junction/symlink) hoặc không kiểm được — WinFreeUp không xóa để tránh xóa nhầm chỗ khác.",
+  "km.protect.bad_path": "Đường dẫn này có dạng lạ — WinFreeUp không xóa để tránh xóa nhầm.",
+  "km.protect.canonical_protected": "Đường thật của mục này trỏ vào một thư mục được bảo vệ — không xóa được.",
 
   "km.level.critical": "🔴 Nghiêm trọng",
   "km.level.warn": "🟠 Nên xử lý",
