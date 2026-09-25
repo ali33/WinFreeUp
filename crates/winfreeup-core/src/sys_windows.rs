@@ -17,8 +17,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use windows_sys::core::{BOOL, PCWSTR, PWSTR};
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, LocalFree, ERROR_ALREADY_EXISTS, ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA,
-    ERROR_NOT_ALL_ASSIGNED, HANDLE, INVALID_HANDLE_VALUE, LUID,
+    ERROR_NOT_ALL_ASSIGNED, ERROR_NO_TOKEN, HANDLE, INVALID_HANDLE_VALUE, LUID,
 };
+use windows_sys::Win32::Globalization::{CompareStringOrdinal, CSTR_EQUAL};
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SetEntriesInAclW,
     EXPLICIT_ACCESS_W, GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, SDDL_REVISION_1, SE_FILE_OBJECT, TRUSTEE_IS_GROUP,
@@ -567,10 +568,19 @@ fn long_path(w: &[u16]) -> io::Result<Vec<u16>> {
 /// `path` gọi đúng tên thật `real` (final path): không đi qua junction/symlink ở thư mục cha nào. So không
 /// phân biệt hoa thường; khác nhau thì khử tên 8.3 bằng GetLongPathNameW rồi so lại.
 fn names_real_path(path: &Path, real: &[u16]) -> bool {
-    let upper = |w: &[u16]| String::from_utf16_lossy(w).to_uppercase();
-    let real = upper(real);
     let given = wide(verbatim(path).as_os_str());
-    upper(&given[..given.len() - 1]) == real || long_path(&given).is_ok_and(|l| upper(&l) == real)
+    same_name(&given[..given.len() - 1], real) || long_path(&given).is_ok_and(|l| same_name(&l, real))
+}
+
+/// So hai tên UTF-16 không phân biệt hoa thường theo bảng hoa/thường của hệ điều hành (từng đơn vị mã, như
+/// NTFS) — KHÔNG theo Unicode đầy đủ của Rust, nơi "ß".to_uppercase() == "SS" dù NTFS coi đó là hai tên khác.
+fn same_name(a: &[u16], b: &[u16]) -> bool {
+    // Đường dẫn Windows tối đa 32767 đơn vị; dài hơn i32 thì chắc chắn không phải tên thật.
+    let (Ok(la), Ok(lb)) = (i32::try_from(a.len()), i32::try_from(b.len())) else {
+        return false;
+    };
+    // SAFETY: a, b là lát cắt hợp lệ, độ dài truyền vào đúng số phần tử (không cần NUL khi độ dài >= 0).
+    unsafe { CompareStringOrdinal(a.as_ptr(), la, b.as_ptr(), lb, 1) == CSTR_EQUAL }
 }
 
 /// `child` là chính `root` hoặc nằm bên dưới nó (so theo ranh giới `\`, để `C:\A` không khớp `C:\AB`).
@@ -785,7 +795,20 @@ struct ThreadPrivileges {
 
 impl ThreadPrivileges {
     /// Mạo danh rồi bật từng đặc quyền; đặc quyền nào không bật được thì ghi vào `notes` và chạy tiếp.
+    /// Ràng buộc: luồng gọi KHÔNG được đang mạo danh sẵn — RevertToSelf trong Drop bỏ mọi mạo danh, kể cả
+    /// lần mạo danh có từ trước, chứ không trả về token cũ.
     fn enable(privileges: &[(PCWSTR, &str)], notes: &mut Vec<String>) -> io::Result<Self> {
+        if cfg!(debug_assertions) {
+            let mut raw: HANDLE = std::ptr::null_mut();
+            // SAFETY: pseudo-handle luồng luôn hợp lệ; raw là biến cục bộ; handle (nếu có) do OwnedHandle đóng.
+            let opened = unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut raw) } != 0;
+            // SAFETY: đọc mã lỗi của luồng hiện tại, ngay sau lời gọi trên.
+            let last = unsafe { GetLastError() };
+            if opened {
+                drop(OwnedHandle(raw));
+            }
+            debug_assert!(!opened && last == ERROR_NO_TOKEN, "ThreadPrivileges: thread is already impersonating");
+        }
         // SAFETY: không có tham số con trỏ; mạo danh chính token tiến trình trên luồng hiện tại.
         check(unsafe { ImpersonateSelf(SecurityImpersonation) })?;
         // Từ đây mọi đường thoát (kể cả `?`) đều qua Drop ⇒ RevertToSelf.
@@ -1273,7 +1296,6 @@ mod tests {
     use windows_sys::Win32::Security::Authorization::{
         ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW, SetNamedSecurityInfoW,
     };
-    use windows_sys::Win32::Foundation::ERROR_NO_TOKEN;
     use windows_sys::Win32::Security::{GetSecurityDescriptorDacl, TokenPrivileges};
     use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
 
@@ -1868,9 +1890,33 @@ mod tests {
         let n = unsafe { GetShortPathNameW(w.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
         assert!(n > 0 && n < buf.len(), "{}", io::Error::last_os_error());
         let short = PathBuf::from(OsString::from_wide(&buf[..n]));
+        // Tên có dấu cách và dài quá 8 ký tự: volume bật 8.3 thì chắc chắn sinh tên ngắn khác tên dài.
+        if short.file_name() == long.file_name() {
+            // Volume tắt sinh tên 8.3 (fsutil 8dot3name): không có tên ngắn để thử — nói rõ thay vì pass suông.
+            eprintln!(
+                "walk_accepts_a_root_given_by_its_short_name: volume không sinh tên 8.3 cho {} — BỎ phần kiểm tên ngắn",
+                long.display()
+            );
+            return;
+        }
+        assert_ne!(short, long);
         let mut n = 0;
         walk_checked(&short, false, &mut ErrorSummary::default(), &mut |_, _, _| n += 1).unwrap();
         assert_eq!(n, 1, "{}", short.display());
+    }
+
+    /// So tên theo bảng hoa/thường của hệ điều hành (như NTFS), không theo Unicode đầy đủ của Rust.
+    #[test]
+    fn same_name_follows_the_os_case_table() {
+        let w = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+        assert!(!same_name(&w("ß"), &w("SS")));
+        assert!(!same_name(&w("aß"), &w("ASS")));
+        assert!(same_name(&w("abc"), &w("ABC")));
+        assert!(same_name(&w("Tệp"), &w("TỆP")));
+        assert!(same_name(&w(r"C:\Thư Mục\Tệp"), &w(r"c:\THƯ MỤC\TỆP")));
+        assert!(!same_name(&w("abc"), &w("abd")));
+        assert!(!same_name(&w("abc"), &w("ab")));
+        assert!(same_name(&[], &[]));
     }
 
     fn ownership_luids() -> [LUID; 3] {
