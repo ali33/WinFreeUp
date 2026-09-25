@@ -83,10 +83,15 @@ pub struct Walk {
 
 fn found(path: PathBuf, meta: &fs::Metadata) -> Found {
     let is_link = is_reparse_point(meta);
+    // Không đọc được giờ ⇒ coi như mới ⇒ không bị lọc "cũ hơn 24 giờ" xóa nhầm.
+    let modified = meta.modified().unwrap_or_else(|_| SystemTime::now());
+    // Bộ cài bung file vào %TEMP% giữ nguyên mtime cũ trong gói, nhưng creation time là lúc
+    // vừa bung ra ⇒ lấy thời điểm MỚI HƠN giữa mtime và creation time làm tuổi, để không
+    // coi file vừa bung là "cũ" rồi xóa nhầm. Không đọc được creation time ⇒ dùng mtime.
+    let created = meta.created().unwrap_or(modified);
     Found {
         bytes: if is_link || meta.is_dir() { 0 } else { meta.len() },
-        // Không đọc được giờ ⇒ coi như mới ⇒ không bị lọc "cũ hơn 24 giờ" xóa nhầm.
-        modified: meta.modified().unwrap_or_else(|_| SystemTime::now()),
+        modified: modified.max(created),
         is_link,
         path,
     }
@@ -152,7 +157,16 @@ pub fn roots_of(targets: &[Target]) -> Vec<PathBuf> {
 pub fn scan_targets(targets: &[Target], now: SystemTime, cancel: &CancelToken) -> Result<ScanResult> {
     let mut r = ScanResult::default();
     for t in targets {
-        let w = walk(&t.root, t.recursive, Some(cancel))?;
+        let w = match walk(&t.root, t.recursive, Some(cancel)) {
+            Ok(w) => w,
+            // Hủy quét là tín hiệu toàn cục ⇒ dừng ngay, không chỉ bỏ qua gốc này.
+            Err(CoreError::Cancelled) => return Err(CoreError::Cancelled),
+            // Gốc lỗi (vd AccessDenied) không được làm hỏng cả nhóm quét, giống clean_targets.
+            Err(_) => {
+                r.notices.push(format!("root_unreadable:{}", t.root.display()));
+                continue;
+            }
+        };
         for f in w.files.iter().filter(|f| t.filter.matches(f, now)) {
             r.add_file(&f.path, f.bytes);
         }
@@ -171,7 +185,12 @@ pub fn clean_targets(targets: &[Target], now: SystemTime, opts: &CleanOptions, p
                 continue;
             }
         };
-        rep.skipped_locked += w.unreadable;
+        // Thư mục/entry không đọc được (vd AccessDenied khi liệt kê) không phải là "file bị khóa"
+        // (đó là DeleteOutcome::Locked ở dưới) nên không cộng vào skipped_locked — ghi số lượng
+        // vào errors để không mất thông tin nhưng cũng không lẫn ý nghĩa với "locked".
+        if w.unreadable > 0 {
+            rep.errors.push(format!("unreadable_entries:{}", w.unreadable));
+        }
         for f in w.files.iter().filter(|f| t.filter.matches(f, now)) {
             match delete_path(&guard, &f.path, opts.dry_run) {
                 Ok(DeleteOutcome::Deleted(b)) => {
@@ -264,6 +283,24 @@ mod tests {
         let r = scan_targets(&[Target::older_than(root, DAY)], SystemTime::now(), &CancelToken::new()).unwrap();
         assert_eq!((r.total_bytes, r.file_count), (100, 1));
         assert_eq!(r.top_items.len(), 1);
+    }
+
+    // Review Focus 1 (mục 1): bộ cài bung file giữ mtime cũ trong gói, nhưng file vừa được tạo
+    // (creation time mới) ⇒ KHÔNG được coi là cũ, dù mtime đã lùi qua ngưỡng older_than. Cố ý
+    // KHÔNG dùng testutil::age ở đây (nó lùi cả creation time) mà chỉ lùi mtime bằng filetime
+    // trực tiếp, để tái tạo đúng tình huống "vừa bung file, mtime cũ nhưng creation time mới".
+    #[test]
+    fn freshly_created_file_with_stale_mtime_is_not_matched_as_old() {
+        let t = tmp();
+        let root = t.path().join("Temp");
+        let f = write_file(&root.join("just-unpacked.tmp"), 10);
+        let old_mtime = SystemTime::now() - Duration::from_secs(48 * 3600);
+        filetime::set_file_mtime(&f, filetime::FileTime::from_system_time(old_mtime)).unwrap();
+        let meta = fs::symlink_metadata(&f).unwrap();
+        let found = found(f.clone(), &meta);
+        assert!(!Filter::OlderThan(DAY).matches(&found, SystemTime::now()));
+        let r = scan_targets(&[Target::older_than(root, DAY)], SystemTime::now(), &CancelToken::new()).unwrap();
+        assert_eq!((r.total_bytes, r.file_count), (0, 0));
     }
 
     // Review Focus 4
@@ -397,5 +434,26 @@ mod tests {
         let rep = c.clean(&env, &scan, &CleanOptions::default(), &NoProgress).unwrap();
         assert!(rep.errors.is_empty());
         assert_eq!(rep.files_deleted, 0);
+    }
+
+    // Review Focus 2 (mục 2): gốc lỗi khác NotFound không được làm hỏng cả nhóm quét — chỉ gốc
+    // đó bị bỏ qua và ghi vào notices, Target khác vẫn quét bình thường, giống clean_targets đã
+    // ghi lỗi rồi đi tiếp. Mô phỏng bằng tên đường dẫn không hợp lệ (ký tự `?*|`) vì đó là cách
+    // đáng tin cậy và không cần đổi ACL để tạo lỗi khác NotFound (đổi ACL có rủi ro để lại thư
+    // mục bị khóa nếu assert thất bại giữa chừng); đã xác nhận kind() != NotFound trước khi quét.
+    #[test]
+    fn root_with_unreadable_metadata_is_skipped_with_a_notice_other_targets_still_scan() {
+        let t = tmp();
+        let bad_root = t.path().join("ten-khong-hop-le-?-*-|");
+        assert_ne!(fs::symlink_metadata(&bad_root).unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        let ok_root = t.path().join("Temp");
+        write_file(&ok_root.join("keep.tmp"), 5);
+        let r = scan_targets(&[Target::all(bad_root.clone()), Target::all(ok_root)], SystemTime::now(), &CancelToken::new()).unwrap();
+        assert_eq!((r.total_bytes, r.file_count), (5, 1));
+        assert!(
+            r.notices.iter().any(|n| *n == format!("root_unreadable:{}", bad_root.display())),
+            "notices: {:?}",
+            r.notices
+        );
     }
 }
