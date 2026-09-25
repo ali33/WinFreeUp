@@ -3,6 +3,14 @@ name = "winfreeup"
 version = "0.1.0"
 edition = "2021"
 
+# Manifest Admin (build.rs, /MANIFESTINPUT qua rustc-link-arg-bins) cũng gắn vào test harness của bin ⇒
+# `cargo test` không nâng quyền gặp os error 740. Crate này chưa có unit test nào; test logic đặt ở
+# winfreeup-core. Muốn thêm test ở đây thì tách src/lib.rs (test harness của lib không nhận -bins).
+[[bin]]
+name = "winfreeup"
+path = "src/main.rs"
+test = false
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

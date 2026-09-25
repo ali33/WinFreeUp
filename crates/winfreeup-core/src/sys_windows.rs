@@ -54,7 +54,8 @@ use windows_sys::Win32::System::Registry::{
 };
 use windows_sys::Win32::System::SystemInformation::{GetSystemDirectoryW, GetSystemWindowsDirectoryW};
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThread, OpenThreadToken, ResumeThread, CREATE_SUSPENDED,
+    GetCurrentProcess, GetCurrentThread, OpenProcess, OpenProcessToken, OpenThread, OpenThreadToken,
+    QueryFullProcessImageNameW, ResumeThread, CREATE_SUSPENDED, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
     THREAD_SUSPEND_RESUME,
 };
 use windows_sys::Win32::UI::Shell::{
@@ -1118,8 +1119,31 @@ impl RealSystem {
     }
 }
 
+/// Đường dẫn đầy đủ ảnh tiến trình `pid` (None nếu không mở được — đã thoát hoặc được bảo vệ).
+fn process_image_path(pid: u32) -> Option<String> {
+    // SAFETY: chỉ xin quyền truy vấn tối thiểu; handle do OwnedHandle đóng.
+    let h = OwnedHandle::new(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) })?;
+    let mut buf = vec![0u16; 32768];
+    let mut len = buf.len() as u32;
+    // SAFETY: h hợp lệ; buf có đúng `len` phần tử u16; len nhận số ký tự đã ghi (không tính NUL).
+    let ok = unsafe { QueryFullProcessImageNameW(h.0, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len) } != 0;
+    ok.then(|| String::from_utf16_lossy(&buf[..len as usize]))
+}
+
+/// `full` kết thúc bằng `suffix` tại ranh giới thành phần đường dẫn (`\`), không phân biệt hoa thường.
+fn path_ends_with(full: &str, suffix: &str) -> bool {
+    let (full, suffix) = (full.to_lowercase(), suffix.trim_start_matches('\\').to_lowercase());
+    !suffix.is_empty()
+        && full.ends_with(&suffix)
+        && (full.len() == suffix.len() || full[..full.len() - suffix.len()].ends_with('\\'))
+}
+
 impl SystemOps for RealSystem {
+    /// `exe_name` chứa `\` ⇒ so theo đuôi đường dẫn ảnh tiến trình (vd `CocCoc\Browser\Application\browser.exe`);
+    /// ngược lại so theo tên file Toolhelp trả về. Không phân biệt hoa thường.
     fn is_process_running(&self, exe_name: &str) -> bool {
+        let file_name = exe_name.rsplit('\\').next().unwrap_or(exe_name);
+        let by_path = file_name.len() != exe_name.len();
         // SAFETY: gọi API chụp danh sách tiến trình; handle do OwnedHandle đóng.
         let Some(snap) = OwnedHandle::new(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else {
             return false;
@@ -1131,7 +1155,9 @@ impl SystemOps for RealSystem {
         let mut more = unsafe { Process32FirstW(snap.0, &mut e) } != 0;
         while more {
             let len = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(e.szExeFile.len());
-            if String::from_utf16_lossy(&e.szExeFile[..len]).eq_ignore_ascii_case(exe_name) {
+            if String::from_utf16_lossy(&e.szExeFile[..len]).eq_ignore_ascii_case(file_name)
+                && (!by_path || process_image_path(e.th32ProcessID).is_some_and(|p| path_ends_with(&p, exe_name)))
+            {
                 return true;
             }
             // SAFETY: như trên.
@@ -1478,6 +1504,23 @@ mod tests {
         let name = me.file_name().unwrap().to_string_lossy().to_string();
         assert!(sys.is_process_running(&name));
         assert!(!sys.is_process_running("khong-co-tien-trinh-nay-3f9a.exe"));
+        // Tên có `\` ⇒ so đuôi đường dẫn ảnh tiến trình (không phân biệt hoa thường).
+        let parent = me.parent().unwrap().file_name().unwrap().to_string_lossy().to_string();
+        assert!(sys.is_process_running(&format!(r"{}\{}", parent.to_uppercase(), name)));
+        assert!(!sys.is_process_running(&format!(r"khong-co-thu-muc-nay-3f9a\{name}")));
+    }
+
+    #[test]
+    fn path_suffix_matches_only_on_component_boundary_ignoring_case() {
+        let full = r"C:\Users\A\AppData\Local\CocCoc\Browser\Application\browser.exe";
+        assert!(path_ends_with(full, r"CocCoc\Browser\Application\browser.exe"));
+        assert!(path_ends_with(full, r"coccoc\BROWSER\application\Browser.EXE"));
+        assert!(path_ends_with(full, r"\CocCoc\Browser\Application\browser.exe"));
+        assert!(path_ends_with(full, full));
+        assert!(!path_ends_with(full, r"occoc\Browser\Application\browser.exe"));
+        assert!(!path_ends_with(r"C:\Program Files\Other\Application\browser.exe", r"CocCoc\Browser\Application\browser.exe"));
+        assert!(!path_ends_with(full, ""));
+        assert!(!path_ends_with(full, r"\"));
     }
 
     #[test]

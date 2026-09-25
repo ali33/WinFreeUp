@@ -21,10 +21,10 @@ jobs:
       - run: npm ci
       - name: Vitest
         run: npm test
-      - name: cargo test (lõi)
-        run: cargo test -p winfreeup-core
-      - name: clippy (lõi)
-        run: cargo clippy -p winfreeup-core --all-targets -- -D warnings
+      - name: cargo test (toàn workspace)
+        run: cargo test --workspace
+      - name: clippy (toàn workspace)
+        run: cargo clippy --workspace --all-targets -- -D warnings
       - name: tauri build (một file exe)
         run: npx tauri build --no-bundle
       - name: Kiểm manifest Admin

@@ -22,7 +22,7 @@ fn browsers(env: &Env) -> Vec<(&'static str, &'static str, Kind, PathBuf)> {
     vec![
         ("chrome", "chrome.exe", Kind::Chromium, la.join(r"Google\Chrome\User Data")),
         ("edge", "msedge.exe", Kind::Chromium, la.join(r"Microsoft\Edge\User Data")),
-        ("coccoc", "browser.exe", Kind::Chromium, la.join(r"CocCoc\Browser\User Data")),
+        ("coccoc", r"CocCoc\Browser\Application\browser.exe", Kind::Chromium, la.join(r"CocCoc\Browser\User Data")),
         ("firefox", "firefox.exe", Kind::Firefox, la.join(r"Mozilla\Firefox\Profiles")),
     ]
 }
@@ -129,6 +129,20 @@ mod tests {
         write_file(&env.local_appdata.join(r"Google\Chrome\User Data\Default\Cache\x"), 1);
         let scan = BrowserCache.scan(&env, &CancelToken::new()).unwrap();
         assert_eq!(scan.notices, vec!["browser_running:chrome".to_string()]);
+    }
+
+    #[test]
+    fn coccoc_is_detected_by_image_path_not_by_bare_browser_exe() {
+        let t = tempfile::tempdir().unwrap();
+        let data = r"CocCoc\Browser\User Data\Default\Cache\x";
+        // Một "browser.exe" bất kỳ (không phải Cốc Cốc) không được coi là Cốc Cốc đang mở.
+        let env = fake_env(t.path(), Arc::new(FakeSys { running: vec!["browser.exe".into()], ..Default::default() }));
+        write_file(&env.local_appdata.join(data), 1);
+        assert!(BrowserCache.scan(&env, &CancelToken::new()).unwrap().notices.is_empty());
+        let running = vec![r"CocCoc\Browser\Application\browser.exe".into()];
+        let env = fake_env(t.path(), Arc::new(FakeSys { running, ..Default::default() }));
+        let scan = BrowserCache.scan(&env, &CancelToken::new()).unwrap();
+        assert_eq!(scan.notices, vec!["browser_running:coccoc".to_string()]);
     }
 
     // Review Focus 4

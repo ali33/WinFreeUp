@@ -94,8 +94,8 @@ chính thức; các mục còn lại ghi nhận hành vi/theo dõi thêm, không
   Mong đợi: ba đặc quyền trên trở về trạng thái `Disabled` (không còn bật thường trực sau khi thao tác cần
   chúng đã xong).
 
-- [ ] **SB-10 — `cargo test -p winfreeup-core` với quyền Admin.** *(CHẶN PHÁT HÀNH nếu chưa chạy)*
-  Bước làm: Mở terminal **Run as administrator**, chạy `cargo test -p winfreeup-core`.
+- [ ] **SB-10 — `cargo test --workspace` với quyền Admin.** *(CHẶN PHÁT HÀNH nếu chưa chạy)*
+  Bước làm: Mở terminal **Run as administrator**, chạy `cargo test --workspace`.
   Mong đợi: các test `take_ownership` khi chạy với quyền Admin kiểm thêm chủ sở hữu mong đợi `O:BA`
   (built-in Administrators); toàn bộ test chỉ chạm thư mục tạm (`tempfile`), không đụng hệ thống thật; test
   pass.
