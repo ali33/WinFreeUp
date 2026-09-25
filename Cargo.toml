@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/winfreeup-core"]
+members = ["crates/winfreeup-core", "src-tauri"]
 
 [profile.release]
 opt-level = "s"
