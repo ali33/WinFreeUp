@@ -1,0 +1,51 @@
+[package]
+name = "winfreeup-diagnose"
+version = "0.1.0"
+edition = "2021"
+
+# Tạm là workspace riêng để build/test độc lập khi nhánh v0.1 chưa gộp xong.
+# Task Tích hợp xoá bảng này và thêm crate vào `members` của workspace gốc.
+[workspace]
+
+[dependencies]
+winfreeup-core = { path = "../winfreeup-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+png = "0.18"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Wdk_System_SystemInformation",
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_NetworkManagement_IpHelper",
+  "Win32_NetworkManagement_Ndis",
+  "Win32_Networking_WinSock",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_Storage_FileSystem",
+  "Win32_System_IO",
+  "Win32_System_Ioctl",
+  "Win32_System_Performance",
+  "Win32_System_Power",
+  "Win32_System_Registry",
+  "Win32_System_SystemInformation",
+  "Win32_System_Threading",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
+] }
+windows = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_System_Com",
+  "Win32_UI_Shell",
+  "Win32_UI_Shell_Common",
+] }
+# Ghim 0.16.0: bản này đòi đúng cặp windows/windows-core ^0.61 như Tauri 2.11. wmi 0.18 khai khoảng
+# ">=0.59, <0.63" nên khi gộp workspace cargo có thể ghép windows 0.61 với windows-core 0.62 ⇒ không biên dịch.
+wmi = "=0.16.0"
+ferrisetw = "1.2"
+
+[dev-dependencies]
+tempfile = "3"
+junction = "2"
