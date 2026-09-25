@@ -8,12 +8,8 @@ use std::ffi::{OsStr, OsString};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf, Prefix};
 
-use windows::core::GUID;
 use windows::Win32::System::Com::CoTaskMemFree;
-use windows::Win32::UI::Shell::{
-    SHGetKnownFolderPath, FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86, KF_FLAG_DEFAULT,
-};
-use windows_sys::core::PWSTR;
+use windows_sys::core::{GUID, PWSTR};
 use windows_sys::Win32::Foundation::{
     CloseHandle, LocalFree, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA, HANDLE,
 };
@@ -24,6 +20,9 @@ use windows_sys::Win32::System::Registry::{
 };
 use windows_sys::Win32::System::SystemInformation::{GetSystemDirectoryW, GetSystemWindowsDirectoryW};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows_sys::Win32::UI::Shell::{
+    SHGetKnownFolderPath, FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86, FOLDERID_Startup, KF_FLAG_DEFAULT,
+};
 
 /// Chuỗi UTF-16 kết thúc bằng 0 cho hàm Win32 `...W`.
 pub fn wide(s: impl AsRef<OsStr>) -> Vec<u16> {
@@ -100,15 +99,33 @@ pub fn system_drive_root() -> Result<PathBuf, String> {
 /// trường của tiến trình — đã đo: `ProgramData`/`USERPROFILE` giả ⇒ kết quả đổi theo. Chỉ dùng hàm này cho
 /// thư mục mà test `system_paths_come_from_the_api_not_from_environment_variables` đã chứng minh không phụ
 /// thuộc biến môi trường (hiện là Program Files, Program Files (x86)).
-pub fn known_folder(id: &GUID) -> Result<PathBuf, String> {
-    // SAFETY: id trỏ vào GUID còn sống; token rỗng = người dùng của tiến trình.
-    let p = unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None) }
-        .map_err(|e| format!("SHGetKnownFolderPath({id:?}): {e}"))?;
-    // SAFETY: khi thành công p là chuỗi kết thúc NUL do API cấp phát, còn sống tới lúc CoTaskMemFree.
-    let path = PathBuf::from(OsString::from_wide(unsafe { p.as_wide() }));
-    // SAFETY: p do SHGetKnownFolderPath cấp phát bằng bộ cấp phát COM, giải phóng đúng một lần.
-    unsafe { CoTaskMemFree(Some(p.0 as *const _)) };
-    Ok(path)
+pub(crate) fn known_folder(id: &GUID) -> Result<PathBuf, String> {
+    let mut p: PWSTR = std::ptr::null_mut();
+    // SAFETY: id trỏ vào GUID còn sống; token rỗng = người dùng của tiến trình; p là biến cục bộ khả ghi.
+    let hr = unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT as u32, std::ptr::null_mut(), &mut p) };
+    let res = if hr < 0 {
+        Err(format!(
+            "SHGetKnownFolderPath({:08X}-{:04X}-{:04X}-…): {}",
+            id.data1,
+            id.data2,
+            id.data3,
+            windows::core::Error::from_hresult(windows::core::HRESULT(hr)).message()
+        ))
+    } else if p.is_null() {
+        Err("SHGetKnownFolderPath: null path".into())
+    } else {
+        let mut len = 0;
+        // SAFETY: khi thành công p là chuỗi kết thúc NUL do API cấp phát, còn sống tới lúc CoTaskMemFree.
+        while unsafe { *p.add(len) } != 0 {
+            len += 1;
+        }
+        // SAFETY: p có đúng len ký tự trước NUL.
+        Ok(PathBuf::from(OsString::from_wide(unsafe { std::slice::from_raw_parts(p, len) })))
+    };
+    // Tài liệu API: người gọi giải phóng *ppszPath bằng CoTaskMemFree dù thành công hay không (null thì vô hại).
+    // SAFETY: p do SHGetKnownFolderPath cấp phát bằng bộ cấp phát COM (hoặc null), giải phóng đúng một lần.
+    unsafe { CoTaskMemFree(Some(p as *const _)) };
+    res
 }
 
 /// `C:\Program Files`.
@@ -140,21 +157,46 @@ pub fn user_profile() -> Result<PathBuf, String> {
 }
 
 /// Thư mục Startup của người dùng, theo HKCU `User Shell Folders\Startup` (người dùng đổi được chỗ, đó là
-/// thư mục của chính họ); chưa đặt thì là chỗ mặc định trong hồ sơ.
+/// thư mục của chính họ); chưa đặt thì là chỗ mặc định trong hồ sơ. Giá trị dùng biến ngoài nhóm hồ sơ
+/// (vd `%OneDrive%`) ⇒ lùi về `SHGetKnownFolderPath(FOLDERID_Startup)`: chấp nhận được vì đây là thư mục của
+/// chính người dùng và chỉ dùng để liệt kê/bật tắt khởi động, không xóa gì trong đó.
 pub fn user_startup() -> Result<PathBuf, String> {
-    let profile = user_profile()?;
-    let appdata = profile.join(r"AppData\Roaming");
-    match read_reg_opt(HKEY_CURRENT_USER, "HKCU", SHELL_FOLDERS_KEY, "Startup")? {
-        Some(raw) => expand_vars(
-            &raw,
-            &[
-                ("SystemDrive", &system_drive()?),
-                ("USERPROFILE", &profile.to_string_lossy()),
-                ("APPDATA", &appdata.to_string_lossy()),
-            ],
-        ),
-        None => Ok(appdata.join(STARTUP_REL)),
+    let raw = read_reg_opt(HKEY_CURRENT_USER, "HKCU", SHELL_FOLDERS_KEY, "Startup")?;
+    match user_startup_from(raw.as_deref(), &user_profile()?, &system_drive()?) {
+        Some(p) => Ok(p),
+        None => known_folder(&FOLDERID_Startup),
     }
+}
+
+/// Hàm thuần của `user_startup`: mở rộng giá trị registry bằng các biến suy ra từ hồ sơ (lấy qua registry theo
+/// SID). `None` nếu gặp biến khác hoặc chuỗi hỏng — người gọi lùi về Shell.
+fn user_startup_from(raw: Option<&str>, profile: &Path, system_drive: &str) -> Option<PathBuf> {
+    let appdata = profile.join(r"AppData\Roaming");
+    let Some(raw) = raw else {
+        return Some(appdata.join(STARTUP_REL));
+    };
+    let profile_s = profile.to_string_lossy();
+    let appdata_s = appdata.to_string_lossy();
+    let local_s = profile.join(r"AppData\Local").to_string_lossy().into_owned();
+    let mut vars: Vec<(&str, &str)> = vec![
+        ("SystemDrive", system_drive),
+        ("USERPROFILE", &profile_s),
+        ("APPDATA", &appdata_s),
+        ("LOCALAPPDATA", &local_s),
+    ];
+    let home = match profile.components().next() {
+        Some(Component::Prefix(p)) if matches!(p.kind(), Prefix::Disk(_)) => {
+            let drive = p.as_os_str().to_string_lossy().into_owned();
+            let rest = profile_s[drive.len()..].to_string();
+            Some((drive, rest))
+        }
+        _ => None,
+    };
+    if let Some((drive, rest)) = &home {
+        vars.push(("HOMEDRIVE", drive));
+        vars.push(("HOMEPATH", rest));
+    }
+    expand_vars(raw, &vars).ok()
 }
 
 /// Thư mục Startup chung, theo HKLM `User Shell Folders\Common Startup` (thường
@@ -348,7 +390,7 @@ mod tests {
 
     #[test]
     fn known_folder_reports_the_raw_error_for_an_unknown_id() {
-        let err = known_folder(&GUID::from_u128(0x1234_5678_9abc_def0_1234_5678_9abc_def0)).unwrap_err();
+        let err = known_folder(&windows_sys::core::GUID::from_u128(0x1234_5678_9abc_def0_1234_5678_9abc_def0)).unwrap_err();
         assert!(err.contains("SHGetKnownFolderPath"), "{err}");
     }
 
@@ -367,17 +409,75 @@ mod tests {
         assert!(expand_vars(r"C:\100%", &vars).is_err());
     }
 
-    /// Trong môi trường sạch của tiến trình test, đường dẫn tự dựng từ registry phải trùng với Shell.
+    #[test]
+    fn user_startup_expands_profile_variables_and_falls_back_on_anything_else() {
+        let profile = Path::new(r"C:\Users\an");
+        let f = |raw: Option<&str>| user_startup_from(raw, profile, "C:");
+        let dflt = PathBuf::from(r"C:\Users\an\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup");
+        assert_eq!(f(None), Some(dflt.clone()));
+        assert_eq!(f(Some(r"%USERPROFILE%\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup")), Some(dflt.clone()));
+        assert_eq!(f(Some(r"%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup")), Some(dflt));
+        assert_eq!(f(Some(r"%LOCALAPPDATA%\Khởi động")), Some(PathBuf::from(r"C:\Users\an\AppData\Local\Khởi động")));
+        assert_eq!(f(Some(r"%HOMEDRIVE%%HOMEPATH%\Startup")), Some(PathBuf::from(r"C:\Users\an\Startup")));
+        assert_eq!(f(Some(r"%SystemDrive%\Startup")), Some(PathBuf::from(r"C:\Startup")));
+        assert_eq!(f(Some(r"D:\Khởi động")), Some(PathBuf::from(r"D:\Khởi động")));
+        // Biến ngoài danh sách (vd OneDrive dời thư mục) hoặc chuỗi hỏng ⇒ None, người gọi lùi về Shell.
+        assert_eq!(f(Some(r"%OneDrive%\Startup")), None);
+        assert_eq!(f(Some(r"C:\100%")), None);
+        assert_eq!(f(Some("")), None);
+        // Hồ sơ không nằm trên ổ có chữ cái ⇒ không biết HOMEDRIVE ⇒ lùi về Shell.
+        assert_eq!(user_startup_from(Some(r"%HOMEDRIVE%\x"), Path::new(r"\\srv\hoso\an"), "C:"), None);
+    }
+
+    const CLEAN_ENV_CHILD: &str = "WFU_DIAG_CLEAN_ENV_CHILD";
+
+    /// Trong môi trường sạch (dựng lại từ API, không thừa hưởng môi trường của người chạy test), đường dẫn tự
+    /// dựng từ registry phải trùng với Shell.
     #[test]
     fn registry_paths_match_the_shell_in_a_clean_environment() {
-        use windows::Win32::UI::Shell::{FOLDERID_CommonStartup, FOLDERID_Profile, FOLDERID_ProgramData, FOLDERID_Startup};
-        let same = |a: PathBuf, b: PathBuf| {
-            assert!(a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy()), "{} ≠ {}", a.display(), b.display())
+        use windows_sys::Win32::UI::Shell::{
+            FOLDERID_CommonStartup, FOLDERID_Profile, FOLDERID_ProgramData, FOLDERID_Startup,
         };
-        same(program_data().unwrap(), known_folder(&FOLDERID_ProgramData).unwrap());
-        same(user_profile().unwrap(), known_folder(&FOLDERID_Profile).unwrap());
-        same(user_startup().unwrap(), known_folder(&FOLDERID_Startup).unwrap());
-        same(common_startup().unwrap(), known_folder(&FOLDERID_CommonStartup).unwrap());
+        if std::env::var_os(CLEAN_ENV_CHILD).is_some() {
+            let same = |a: PathBuf, b: PathBuf| {
+                assert!(a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy()), "{} ≠ {}", a.display(), b.display())
+            };
+            same(program_data().unwrap(), known_folder(&FOLDERID_ProgramData).unwrap());
+            same(user_profile().unwrap(), known_folder(&FOLDERID_Profile).unwrap());
+            same(user_startup().unwrap(), known_folder(&FOLDERID_Startup).unwrap());
+            same(common_startup().unwrap(), known_folder(&FOLDERID_CommonStartup).unwrap());
+            return;
+        }
+        let windir = windows_dir().unwrap();
+        let system32 = system_dir().unwrap();
+        let drive = system_drive().unwrap();
+        let data = program_data().unwrap();
+        let profile = user_profile().unwrap();
+        let home_path = profile.to_string_lossy()[drive.len()..].to_string();
+        let mut path = system32.clone().into_os_string();
+        path.push(";");
+        path.push(&windir);
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.env_clear()
+            .args(["--exact", "util::tests::registry_paths_match_the_shell_in_a_clean_environment", "--test-threads=1"])
+            .env(CLEAN_ENV_CHILD, "1")
+            .env("SystemRoot", &windir)
+            .env("windir", &windir)
+            .env("SystemDrive", &drive)
+            .env("PATH", path)
+            .env("TEMP", windir.join("Temp"))
+            .env("TMP", windir.join("Temp"))
+            .env("ProgramData", &data)
+            .env("ALLUSERSPROFILE", &data)
+            .env("USERPROFILE", &profile)
+            .env("APPDATA", profile.join(r"AppData\Roaming"))
+            .env("LOCALAPPDATA", profile.join(r"AppData\Local"))
+            .env("HOMEDRIVE", &drive)
+            .env("HOMEPATH", home_path);
+        let out = cmd.output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+        assert!(stdout.contains("1 passed"), "{stdout}");
     }
 
     const FAKE_ENV_CHILD: &str = "WFU_DIAG_FAKE_ENV_CHILD";
