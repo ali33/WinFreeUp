@@ -3,12 +3,14 @@
 //! chỉ đổi bit trạng thái và dấu thời gian của giá trị StartupApproved, không bao giờ đụng tới giá trị `Run`
 //! hay file trong thư mục Startup, nên bật lại được bất cứ lúc nào. Mỗi lần đổi ghi nhật ký TRƯỚC khi ghi
 //! registry: không ghi được nhật ký thì không đổi.
-use std::path::PathBuf;
+use std::os::windows::fs::FileTypeExt;
+use std::path::{Component, Path, PathBuf, Prefix};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS};
+use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
 use windows_sys::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegEnumValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
     HKEY_LOCAL_MACHINE, KEY_READ, KEY_SET_VALUE, KEY_WOW64_64KEY, REG_BINARY, REG_EXPAND_SZ, REG_OPTION_NON_VOLATILE, REG_SZ,
@@ -100,6 +102,35 @@ fn filetime_now() -> u64 {
 /// không giả được dòng nhật ký.
 fn log_safe(s: &str) -> String {
     s.chars().map(|c| if c.is_control() { '?' } else { c }).collect()
+}
+
+/// Giá trị `GetDriveTypeW` (WindowsProgramming — feature chưa bật trong Cargo.toml nên khai tại chỗ).
+const DRIVE_REMOVABLE: u32 = 2;
+const DRIVE_FIXED: u32 = 3;
+
+/// Tiến trình Admin chỉ đọc thư mục Startup nằm trên ổ cục bộ (ổ cứng / ổ rời có chữ cái): đường UNC, đường
+/// thiết bị, ổ mạng gắn chữ cái… ⇒ từ chối trước khi chạm tới, để không bao giờ tự kết nối SMB ra ngoài.
+fn local_folder_check(dir: &Path, drive_type: impl Fn(&Path) -> u32) -> Result<(), String> {
+    let letter = match dir.components().next() {
+        Some(Component::Prefix(p)) => match p.kind() {
+            Prefix::Disk(l) | Prefix::VerbatimDisk(l) => Some(l.to_ascii_uppercase()),
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(letter) = letter else {
+        return Err(format!("{}: not on a local drive, not read", dir.display()));
+    };
+    match drive_type(&PathBuf::from(format!("{}:\\", letter as char))) {
+        DRIVE_FIXED | DRIVE_REMOVABLE => Ok(()),
+        t => Err(format!("{}: drive type {t} is not a local disk, not read", dir.display())),
+    }
+}
+
+fn real_drive_type(root: &Path) -> u32 {
+    let w = wide(root);
+    // SAFETY: w là chuỗi kết thúc NUL còn sống trong suốt lời gọi.
+    unsafe { GetDriveTypeW(w.as_ptr()) }
 }
 
 /// Thao tác registry cần cho danh sách khởi động — bản thật `WinRegistry`, test dùng bản giả trong bộ nhớ.
@@ -270,6 +301,7 @@ impl Startup {
     }
 
     /// Registry thật và hai thư mục Startup lấy qua `util` (registry/API), không qua biến môi trường.
+    /// Luôn `Ok`: không xác định được thư mục nào thì lỗi đó nằm trong `list().errors` của nguồn tương ứng.
     pub fn from_system(log: Arc<ActionLog>) -> Result<Self, String> {
         Ok(Startup {
             reg: Box::new(WinRegistry),
@@ -287,6 +319,15 @@ impl Startup {
             StartupSource::UserFolder | StartupSource::CommonFolder => {
                 let dir = if source == StartupSource::UserFolder { &self.user_folder } else { &self.common_folder };
                 let dir = dir.as_ref().map_err(Clone::clone)?;
+                local_folder_check(dir, real_drive_type)?;
+                match std::fs::symlink_metadata(dir) {
+                    Ok(m) if m.file_type().is_symlink() => {
+                        return Err(format!("{}: is a symlink or junction (reparse point), not followed", dir.display()))
+                    }
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+                    Err(e) => return Err(format!("{}: {e}", dir.display())),
+                }
                 let rd = match std::fs::read_dir(dir) {
                     Ok(rd) => rd,
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -296,7 +337,9 @@ impl Startup {
                 for e in rd {
                     let e = e.map_err(|e| format!("{}: {e}", dir.display()))?;
                     let name = e.file_name().to_string_lossy().to_string();
-                    if e.file_type().map(|t| t.is_file()).unwrap_or(false) && !name.eq_ignore_ascii_case("desktop.ini") {
+                    // File thường hoặc symlink file (không đi theo đích); thư mục và junction/symlink thư mục thì bỏ.
+                    let is_file = e.file_type().map(|t| t.is_file() || t.is_symlink_file()).unwrap_or(false);
+                    if is_file && !name.eq_ignore_ascii_case("desktop.ini") {
                         v.push((name, e.path().display().to_string()));
                     }
                 }
@@ -368,7 +411,6 @@ impl Startup {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -589,6 +631,90 @@ mod tests {
         assert!(s.enabled_count().is_err());
         let err = s.set_enabled("hkcu_run:OneDrive", false).unwrap_err();
         assert!(err.contains("Access is denied"), "không đọc được trạng thái cũ thì không ghi đè: {err}");
+    }
+
+    #[test]
+    fn startup_folders_off_the_local_disks_are_never_read() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let types = |root: &Path| {
+            asked.borrow_mut().push(root.to_path_buf());
+            match root.to_string_lossy().as_ref() {
+                r"C:\" => 3, // DRIVE_FIXED
+                r"E:\" => 2, // DRIVE_REMOVABLE
+                r"Z:\" => 4, // DRIVE_REMOTE (ổ mạng gắn chữ cái)
+                _ => 5,      // DRIVE_CDROM
+            }
+        };
+        assert_eq!(local_folder_check(Path::new(r"C:\Users\an\Startup"), types), Ok(()));
+        assert_eq!(local_folder_check(Path::new(r"\\?\C:\Users\an\Startup"), types), Ok(()));
+        assert_eq!(local_folder_check(Path::new(r"e:\Startup"), types), Ok(()));
+        assert_eq!(asked.borrow().last().unwrap(), Path::new(r"E:\"));
+        let n = asked.borrow().len();
+        for p in [
+            r"\\may-chu\share\Startup",
+            r"\\?\UNC\may-chu\share\Startup",
+            r"\\.\pipe\x",
+            r"\\?\Volume{12345678-0000-0000-0000-000000000000}\Startup",
+            r"Startup",
+            r"\Users\an\Startup",
+        ] {
+            let err = local_folder_check(Path::new(p), types).unwrap_err();
+            assert!(err.contains(p) && err.contains("not on a local drive"), "{err}");
+        }
+        assert_eq!(asked.borrow().len(), n, "đường UNC/thiết bị bị từ chối trước khi hỏi loại ổ");
+        for p in [r"Z:\Startup", r"D:\Startup"] {
+            let err = local_folder_check(Path::new(p), types).unwrap_err();
+            assert!(err.contains(p) && err.contains("drive type"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_network_startup_folder_is_an_error_of_that_source_only() {
+        let t = tempfile::tempdir().unwrap();
+        let s = Startup {
+            reg: Box::new(reg_with_run()),
+            user_folder: Ok(PathBuf::from(r"\\may-chu-khong-co.invalid\share\Startup")),
+            common_folder: Ok(t.path().join("khong-co")),
+            log: Arc::new(ActionLog::new(t.path().join("logs"))),
+        };
+        let l = s.list();
+        assert_eq!(l.errors.len(), 1, "{:?}", l.errors);
+        assert!(l.errors[0].contains(r"\\may-chu-khong-co.invalid"), "{:?}", l.errors);
+        assert_eq!(l.entries.len(), 2);
+    }
+
+    /// Symlink file trong thư mục Startup vẫn được liệt kê (không đi theo nó); symlink/junction thư mục thì không.
+    /// Tạo symlink file cần SeCreateSymbolicLink hoặc Developer Mode — không có thì bỏ qua phần đó (in lý do).
+    #[test]
+    fn file_symlinks_are_listed_without_being_followed_and_dir_links_are_not() {
+        let (t, s) = setup(FakeReg::default());
+        let user = t.path().join("user");
+        junction::create(t.path(), user.join("ThuMucNoi")).unwrap();
+        std::fs::create_dir(user.join("ThuMucThat")).unwrap();
+        if let Err(e) = std::os::windows::fs::symlink_file(r"\\may-chu-khong-co.invalid\x\app.exe", user.join("Mang.lnk")) {
+            eprintln!("bỏ qua phần symlink file: không tạo được symlink không cần quyền ({e})");
+            let names: Vec<_> = s.list().entries.into_iter().map(|e| e.name).collect();
+            assert_eq!(names, vec!["Zalo.lnk"]);
+            return;
+        }
+        let names: Vec<_> = s.list().entries.into_iter().map(|e| e.name).collect();
+        assert_eq!(names, vec!["Mang.lnk", "Zalo.lnk"]);
+    }
+
+    #[test]
+    fn a_startup_folder_that_is_itself_a_junction_is_not_followed() {
+        let t = tempfile::tempdir().unwrap();
+        let target = t.path().join("dich");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("An.lnk"), "x").unwrap();
+        let link = t.path().join("Startup");
+        junction::create(&target, &link).unwrap();
+        let log = Arc::new(ActionLog::new(t.path().join("logs")));
+        let s = Startup::new(Box::new(FakeReg::default()), link, t.path().join("khong-co"), log);
+        let l = s.list();
+        assert!(l.entries.is_empty(), "{:?}", l.entries);
+        assert_eq!(l.errors.len(), 1, "{:?}", l.errors);
+        assert!(l.errors[0].contains("reparse point"), "{:?}", l.errors);
     }
 
     #[test]
