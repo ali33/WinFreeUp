@@ -43,6 +43,10 @@ fn canonical_location(path: &Path) -> io::Result<PathBuf> {
 pub struct Guard {
     roots: Vec<PathBuf>,
     rejected: Vec<PathBuf>,
+    /// Gốc tồn tại nhưng không mở/đọc được (AccessDenied, sharing violation, tên lỗi…): khác
+    /// "bị loại vì là liên kết" nên tách riêng để giao diện báo đúng nghĩa. Kèm thông điệp gốc
+    /// để ghi nhật ký.
+    unreadable: Vec<(PathBuf, String)>,
     /// Handle ghim các gốc, cùng thứ tự với `roots` (không `FILE_SHARE_DELETE`): suốt đời
     /// Guard không ai đổi tên hay tráo được gốc. `Arc` vì Guard `Clone`; handle đóng khi bản
     /// sao cuối bị drop, hoặc khi chính gốc đó được xóa (`remove_empty_dir`).
@@ -54,6 +58,7 @@ enum RootCheck {
     Accepted(PathBuf, Option<fs::File>),
     Missing,
     Rejected,
+    Unreadable(String),
 }
 
 impl Guard {
@@ -63,6 +68,7 @@ impl Guard {
     pub fn new(roots: &[PathBuf]) -> Guard {
         let mut accepted = Vec::new();
         let mut rejected = Vec::new();
+        let mut unreadable = Vec::new();
         let mut pins = Vec::new();
         for r in roots {
             match check_root(r) {
@@ -72,14 +78,20 @@ impl Guard {
                 }
                 RootCheck::Missing => {}
                 RootCheck::Rejected => rejected.push(r.clone()),
+                RootCheck::Unreadable(msg) => unreadable.push((r.clone(), msg)),
             }
         }
-        Guard { roots: accepted, rejected, pins: Arc::new(Mutex::new(pins)) }
+        Guard { roots: accepted, rejected, unreadable, pins: Arc::new(Mutex::new(pins)) }
     }
 
     /// Các gốc bị loại vì là liên kết hoặc nằm dưới liên kết: không xóa gì dưới chúng.
     pub fn rejected_roots(&self) -> &[PathBuf] {
         &self.rejected
+    }
+
+    /// Các gốc tồn tại nhưng không mở/đọc được, kèm thông điệp lỗi gốc: cũng không xóa gì dưới chúng.
+    pub fn unreadable_roots(&self) -> &[(PathBuf, String)] {
+        &self.unreadable
     }
 
     pub fn is_allowed(&self, path: &Path) -> bool {
@@ -127,7 +139,7 @@ fn is_locked(e: &io::Error) -> bool {
     matches!(e.raw_os_error(), Some(ERROR_SHARING_VIOLATION) | Some(ERROR_LOCK_VIOLATION))
 }
 
-fn is_vanished(e: &io::Error) -> bool {
+pub(crate) fn is_vanished(e: &io::Error) -> bool {
     e.kind() == io::ErrorKind::NotFound
         || matches!(
             e.raw_os_error(),
@@ -254,24 +266,45 @@ fn literal_long_path(path: &Path) -> io::Result<PathBuf> {
     }
 }
 
-/// So hai đường dẫn không phân biệt hoa/thường, bỏ qua dấu `\` cuối.
+/// So hai đường dẫn không phân biệt hoa/thường, bỏ qua dấu `\` cuối. Theo bảng hoa/thường của hệ
+/// điều hành (`CompareStringOrdinal`, từng đơn vị mã như NTFS) chứ không theo Unicode đầy đủ của
+/// Rust — nơi "ß".to_uppercase() == "SS" dù NTFS coi đó là hai tên khác.
+#[cfg(windows)]
 fn same_path_ci(a: &Path, b: &Path) -> bool {
-    let norm = |p: &Path| p.to_string_lossy().trim_end_matches('\\').to_lowercase();
-    norm(a) == norm(b)
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Globalization::{CompareStringOrdinal, CSTR_EQUAL};
+    const SEP: u16 = b'\\' as u16;
+    let norm = |p: &Path| {
+        let mut w: Vec<u16> = p.as_os_str().encode_wide().collect();
+        while w.last() == Some(&SEP) {
+            w.pop();
+        }
+        w
+    };
+    let (a, b) = (norm(a), norm(b));
+    let (Ok(la), Ok(lb)) = (i32::try_from(a.len()), i32::try_from(b.len())) else {
+        return false;
+    };
+    // SAFETY: a, b là Vec hợp lệ, độ dài truyền vào đúng số phần tử (độ dài >= 0 ⇒ không cần NUL).
+    unsafe { CompareStringOrdinal(a.as_ptr(), la, b.as_ptr(), lb, 1) == CSTR_EQUAL }
 }
 
 /// Xét một gốc: phải tồn tại, không phải reparse point, và đường dẫn thật của handle
 /// trùng đường dẫn chữ (không có liên kết ở tổ tiên). Handle trả về để ghim gốc.
 #[cfg(windows)]
 fn check_root(root: &Path) -> RootCheck {
+    // Mở/đọc thuộc tính lỗi (AccessDenied, sharing violation, tên không hợp lệ…) là "không đọc
+    // được", KHÔNG phải "là liên kết" — báo sai nghĩa làm người dùng đi tìm junction không có.
+    // Liên kết (gốc hay tổ tiên) chỉ được kết luận khi đã mở được và thấy nó.
     let pin = match open_root_pin(root) {
         Ok(f) => f,
         Err(e) if is_vanished(&e) => return RootCheck::Missing,
-        Err(_) => return RootCheck::Rejected,
+        Err(e) => return RootCheck::Unreadable(io_err(root, e).to_string()),
     };
     let is_dir = match pin.metadata() {
         Ok(m) if !is_reparse_point(&m) => m.is_dir(),
-        _ => return RootCheck::Rejected,
+        Ok(_) => return RootCheck::Rejected,
+        Err(e) => return RootCheck::Unreadable(io_err(root, e).to_string()),
     };
     let (Ok(real), Ok(literal)) = (final_path(&pin), literal_long_path(root)) else {
         return RootCheck::Rejected;
@@ -285,9 +318,10 @@ fn check_root(root: &Path) -> RootCheck {
     }
 }
 
-/// Số hard link của file mà handle trỏ tới.
 #[cfg(windows)]
-fn link_count(file: &fs::File) -> io::Result<u32> {
+fn file_info(
+    file: &fs::File,
+) -> io::Result<windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
         GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
@@ -298,7 +332,54 @@ fn link_count(file: &fs::File) -> io::Result<u32> {
     if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(info.nNumberOfLinks)
+    Ok(info)
+}
+
+/// Số hard link của file mà handle trỏ tới.
+#[cfg(windows)]
+fn link_count(file: &fs::File) -> io::Result<u32> {
+    file_info(file).map(|i| i.nNumberOfLinks)
+}
+
+/// Định danh dữ liệu của một file có nhiều hard link: (số serial ổ, chỉ số file).
+pub(crate) type LinkId = (u32, u64);
+
+/// Như `fs::symlink_metadata` (không đi theo reparse point), kèm định danh dữ liệu khi file có
+/// hơn một hard link — để khi quét chỉ đếm byte MỘT lần cho mọi tên trỏ cùng dữ liệu.
+///
+/// Chi phí gần bằng `symlink_metadata` của std: std cũng mở handle quyền 0 rồi gọi
+/// `GetFileInformationByHandle`; ở đây chỉ thêm một lời gọi đó nữa trên cùng handle (không mở
+/// thêm), và chỉ cho file thường. Mở lỗi khác "biến mất" (vd sharing violation của pagefile) ⇒ lùi
+/// về `symlink_metadata` (std tự lùi sang `FindFirstFileW`), coi như một link.
+#[cfg(windows)]
+pub(crate) fn lstat_with_link_id(path: &Path) -> io::Result<(fs::Metadata, Option<LinkId>)> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE,
+    };
+    let file = match fs::OpenOptions::new()
+        .access_mode(0)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) if is_vanished(&e) => return Err(e),
+        Err(_) => return fs::symlink_metadata(path).map(|m| (m, None)),
+    };
+    let meta = file.metadata()?;
+    if meta.is_dir() || is_reparse_point(&meta) {
+        return Ok((meta, None));
+    }
+    let id = match file_info(&file) {
+        Ok(i) if i.nNumberOfLinks > 1 => Some((
+            i.dwVolumeSerialNumber,
+            (u64::from(i.nFileIndexHigh) << 32) | u64::from(i.nFileIndexLow),
+        )),
+        _ => None,
+    };
+    Ok((meta, id))
 }
 
 #[cfg(windows)]
@@ -444,8 +525,9 @@ fn delete_checked_by_handle(guard: &Guard, path: &Path) -> Result<DeleteOutcome>
 pub fn delete_path(guard: &Guard, path: &Path, dry_run: bool) -> Result<DeleteOutcome> {
     let meta = match fs::symlink_metadata(path) {
         Ok(m) => m,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(DeleteOutcome::Vanished),
-        Err(e) => return Err(io_err(path, e)),
+        // Cùng cách phân loại như đường handle: file delete-pending trả AccessDenied ⇒ Locked,
+        // biến mất ⇒ Vanished — không thành lỗi thô trên băng hổ phách.
+        Err(e) => return classify(path, e),
     };
     guard.check(path)?;
     if !dry_run {
@@ -745,6 +827,77 @@ mod tests {
         dispose_legacy(&file, attrs).unwrap();
         drop(file);
         assert!(fs::symlink_metadata(&f).is_err());
+    }
+
+    #[test]
+    fn root_that_cannot_be_opened_is_unreadable_not_rejected() {
+        let (t, _root, _o) = setup();
+        let bad = t.path().join("sai-?-*");
+        let guard = Guard::new(std::slice::from_ref(&bad));
+        assert!(guard.rejected_roots().is_empty());
+        let un = guard.unreadable_roots();
+        assert_eq!(un.len(), 1);
+        assert_eq!(un[0].0, bad);
+        assert!(!un[0].1.is_empty());
+    }
+
+    #[test]
+    fn same_path_ci_uses_the_os_case_table() {
+        assert!(same_path_ci(Path::new(r"C:\Users\Ánh\Temp\"), Path::new(r"c:\users\ánh\temp")));
+        // Rust: "ß".to_uppercase() == "SS"; NTFS coi hai tên này khác nhau.
+        assert!(!same_path_ci(Path::new(r"C:\straße"), Path::new(r"C:\STRASSE")));
+        assert!(!same_path_ci(Path::new(r"C:\a"), Path::new(r"C:\ab")));
+    }
+
+    #[test]
+    fn hard_links_share_one_link_id() {
+        let (_t, root, _o) = setup();
+        let f = write_file(&root.join("a"), 3);
+        let solo = write_file(&root.join("solo"), 3);
+        fs::hard_link(&f, root.join("b")).unwrap();
+        let (_, ia) = lstat_with_link_id(&f).unwrap();
+        let (_, ib) = lstat_with_link_id(&root.join("b")).unwrap();
+        assert!(ia.is_some());
+        assert_eq!(ia, ib);
+        assert_eq!(lstat_with_link_id(&solo).unwrap().1, None);
+        assert_eq!(lstat_with_link_id(&root).unwrap().1, None);
+        assert!(is_vanished(&lstat_with_link_id(&root.join("khong-co")).unwrap_err()));
+    }
+
+    /// File đang chờ xóa (đã đặt cờ xóa kiểu cũ, còn handle khác mở): không được thành lỗi thô.
+    #[test]
+    fn delete_pending_file_is_classified_not_a_raw_error() {
+        let (_t, root, _o) = setup();
+        let f = write_file(&root.join("pending.tmp"), 5);
+        let keep = fs::OpenOptions::new().read(true).share_mode(7).open(&f).unwrap();
+        let del = open_for_delete(&f).unwrap();
+        let attrs = del.metadata().unwrap().file_attributes();
+        dispose_legacy(&del, attrs).unwrap();
+        drop(del);
+        let guard = Guard::new(std::slice::from_ref(&root));
+        let out = delete_path(&guard, &f, false);
+        assert!(matches!(out, Ok(DeleteOutcome::Locked | DeleteOutcome::Vanished)), "{out:?}");
+        // Trên máy test std lùi sang FindFirstFileW nên vẫn lấy được metadata; dù sao không được Err.
+        assert!(delete_path(&guard, &f, true).is_ok());
+        drop(keep);
+        assert!(fs::symlink_metadata(&f).is_err());
+    }
+
+    /// Các mã lỗi `symlink_metadata` có thể trả trong `delete_path` (nay đi qua `classify`, vd file
+    /// delete-pending ⇒ AccessDenied khi std không lùi được sang FindFirstFileW).
+    #[test]
+    fn metadata_errors_are_classified_like_the_handle_path() {
+        let p = Path::new(r"C:\x");
+        for (code, want) in [
+            (2, DeleteOutcome::Vanished),
+            (3, DeleteOutcome::Vanished),
+            (303, DeleteOutcome::Vanished),
+            (5, DeleteOutcome::Locked),
+            (32, DeleteOutcome::Locked),
+        ] {
+            assert_eq!(classify(p, io::Error::from_raw_os_error(code)).unwrap(), want, "code {code}");
+        }
+        assert!(classify(p, io::Error::from_raw_os_error(123)).is_err());
     }
 
     #[test]

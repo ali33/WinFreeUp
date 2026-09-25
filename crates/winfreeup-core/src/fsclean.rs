@@ -1,12 +1,14 @@
 //! Duyệt cây thư mục (không đi theo reparse point) và dọn theo danh sách `Target`.
 use std::cmp::Reverse;
-use std::fs;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::env::Env;
 use crate::error::{io_err, CoreError, Result};
-use crate::safety::{delete_path, is_reparse_point, remove_empty_dir, DeleteOutcome, Guard};
+use crate::safety::{
+    delete_path, is_reparse_point, is_vanished, lstat_with_link_id, remove_empty_dir, DeleteOutcome, Guard, LinkId,
+};
 use crate::types::{
     CancelToken, CleanOptions, CleanReport, Cleaner, ItemAction, Progress, RiskLevel, ScanResult,
 };
@@ -81,7 +83,7 @@ pub struct Walk {
     pub unreadable: u64,
 }
 
-fn found(path: PathBuf, meta: &fs::Metadata) -> Found {
+fn found(path: PathBuf, meta: &std::fs::Metadata) -> Found {
     let is_link = is_reparse_point(meta);
     // Không đọc được giờ ⇒ coi như mới ⇒ không bị lọc "cũ hơn 24 giờ" xóa nhầm.
     let modified = meta.modified().unwrap_or_else(|_| SystemTime::now());
@@ -99,9 +101,15 @@ fn found(path: PathBuf, meta: &fs::Metadata) -> Found {
 
 /// Liệt kê file (kể cả liên kết, coi như "file" 0 byte) và thư mục con. Không bao giờ đi vào reparse point.
 /// Gốc là reparse point ⇒ bỏ qua cả gốc. Gốc là file ⇒ chính nó là ứng viên.
+/// File nhiều hard link chỉ được tính byte ở tên đầu tiên gặp; các tên sau mang `bytes = 0`.
 pub fn walk(root: &Path, recursive: bool, cancel: Option<&CancelToken>) -> Result<Walk> {
+    walk_dedup(root, recursive, cancel, &mut HashSet::new())
+}
+
+/// Như `walk`, với tập định danh hard link dùng chung cho cả một lần quét/dọn (nhiều gốc).
+fn walk_dedup(root: &Path, recursive: bool, cancel: Option<&CancelToken>, seen: &mut HashSet<LinkId>) -> Result<Walk> {
     let mut w = Walk { files: vec![], dirs: vec![], unreadable: 0 };
-    let meta = match fs::symlink_metadata(root) {
+    let (meta, id) = match lstat_with_link_id(root) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(w),
         Err(e) => return Err(io_err(root, e)),
@@ -110,30 +118,66 @@ pub fn walk(root: &Path, recursive: bool, cancel: Option<&CancelToken>) -> Resul
         return Ok(w);
     }
     if !meta.is_dir() {
-        w.files.push(found(root.to_path_buf(), &meta));
+        push_file(&mut w, root.to_path_buf(), &meta, id, seen);
         return Ok(w);
     }
-    let mut stack = vec![root.to_path_buf()];
+    walk_dirs(&mut w, vec![root.to_path_buf()], recursive, cancel, seen)?;
+    Ok(w)
+}
+
+/// Tên thứ hai trở đi của cùng dữ liệu (hard link) mang 0 byte: xóa một tên không giải phóng gì
+/// khi còn tên khác, nên cộng mọi tên sẽ phóng to số dự tính (Windows.old có rất nhiều cặp như vậy).
+fn push_file(w: &mut Walk, path: PathBuf, meta: &std::fs::Metadata, id: Option<LinkId>, seen: &mut HashSet<LinkId>) {
+    let mut f = found(path, meta);
+    if id.is_some_and(|id| !seen.insert(id)) {
+        f.bytes = 0;
+    }
+    w.files.push(f);
+}
+
+/// Duyệt các thư mục trong `stack`. Mục biến mất giữa lúc liệt kê và lúc đọc (thư mục bị xóa sau
+/// khi vào stack, entry mất trước khi lấy thuộc tính, file đang chờ xóa) là chuyện thường của
+/// %TEMP% và không làm thiếu số liệu nào ⇒ bỏ qua lặng lẽ, không cộng vào `unreadable` (thứ sinh
+/// băng cảnh báo trên giao diện).
+fn walk_dirs(
+    w: &mut Walk,
+    mut stack: Vec<PathBuf>,
+    recursive: bool,
+    cancel: Option<&CancelToken>,
+    seen: &mut HashSet<LinkId>,
+) -> Result<()> {
     while let Some(dir) = stack.pop() {
         if cancel.is_some_and(|c| c.is_cancelled()) {
             return Err(CoreError::Cancelled);
         }
-        let entries = match fs::read_dir(&dir) {
+        let entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
-            Err(_) => {
-                w.unreadable += 1;
+            Err(e) => {
+                if !is_vanished(&e) {
+                    w.unreadable += 1;
+                }
                 continue;
             }
         };
         for entry in entries {
-            let Ok(entry) = entry else {
-                w.unreadable += 1;
-                continue;
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    if !is_vanished(&e) {
+                        w.unreadable += 1;
+                    }
+                    continue;
+                }
             };
             let path = entry.path();
-            let Ok(meta) = fs::symlink_metadata(&path) else {
-                w.unreadable += 1;
-                continue;
+            let (meta, id) = match lstat_with_link_id(&path) {
+                Ok(m) => m,
+                Err(e) => {
+                    if !is_vanished(&e) {
+                        w.unreadable += 1;
+                    }
+                    continue;
+                }
             };
             if is_reparse_point(&meta) {
                 w.files.push(found(path, &meta));
@@ -143,11 +187,11 @@ pub fn walk(root: &Path, recursive: bool, cancel: Option<&CancelToken>) -> Resul
                     stack.push(path);
                 }
             } else {
-                w.files.push(found(path, &meta));
+                push_file(w, path, &meta, id, seen);
             }
         }
     }
-    Ok(w)
+    Ok(())
 }
 
 pub fn roots_of(targets: &[Target]) -> Vec<PathBuf> {
@@ -159,12 +203,18 @@ pub fn scan_targets(targets: &[Target], now: SystemTime, cancel: &CancelToken) -
     // Guard chỉ sống trong lời gọi này (không lưu lại): xét gốc nào là reparse point hoặc có
     // tổ tiên là junction/ổ ánh xạ, để bỏ qua trước khi quét thay vì đếm nhầm byte dưới đó.
     let guard = Guard::new(&roots_of(targets));
+    // Hard link được gộp trong phạm vi cả lần quét, kể cả khi hai tên nằm dưới hai gốc khác nhau.
+    let mut seen = HashSet::new();
     for t in targets {
         if guard.rejected_roots().iter().any(|p| p == &t.root) {
             r.notices.push(format!("root_rejected:{}", t.root.display()));
             continue;
         }
-        let w = match walk(&t.root, t.recursive, Some(cancel)) {
+        if guard.unreadable_roots().iter().any(|(p, _)| p == &t.root) {
+            r.notices.push(format!("root_unreadable:{}", t.root.display()));
+            continue;
+        }
+        let w = match walk_dedup(&t.root, t.recursive, Some(cancel), &mut seen) {
             Ok(w) => w,
             // Hủy quét là tín hiệu toàn cục ⇒ dừng ngay, không chỉ bỏ qua gốc này.
             Err(CoreError::Cancelled) => return Err(CoreError::Cancelled),
@@ -186,12 +236,19 @@ pub fn clean_targets(targets: &[Target], now: SystemTime, opts: &CleanOptions, p
     // target, ghi một dòng lỗi duy nhất thay vì mỗi file dưới nó một lỗi OutsideRoots.
     let guard = Guard::new(&roots_of(targets));
     let mut rep = CleanReport { dry_run: opts.dry_run, ..Default::default() };
+    let mut seen = HashSet::new();
     for t in targets {
         if guard.rejected_roots().iter().any(|p| p == &t.root) {
             rep.errors.push(format!("root_rejected:{}", t.root.display()));
             continue;
         }
-        let mut w = match walk(&t.root, t.recursive, None) {
+        if let Some((_, msg)) = guard.unreadable_roots().iter().find(|(p, _)| p == &t.root) {
+            // Thông điệp gốc (có đường dẫn/mã lỗi hệ thống) chỉ vào nhật ký; giao diện nhận mã dịch được.
+            progress.item(ItemAction::Failed, &t.root, 0, Some(msg));
+            rep.errors.push(format!("root_unreadable:{}", t.root.display()));
+            continue;
+        }
+        let mut w = match walk_dedup(&t.root, t.recursive, None, &mut seen) {
             Ok(w) => w,
             Err(e) => {
                 // Lỗi thô (vd "C:\...: Access is denied. (os error 5)") không được lộ ra giao
@@ -217,6 +274,9 @@ pub fn clean_targets(targets: &[Target], now: SystemTime, opts: &CleanOptions, p
                     progress.item(ItemAction::Deleted, &f.path, b, None);
                 }
                 Ok(DeleteOutcome::WouldDelete(b)) => {
+                    // `f.bytes` đã gộp hard link (tên thứ hai trở đi = 0) ⇒ chạy thử khớp số quét
+                    // và khớp tổng xóa thật (xóa thật: tên cuối cùng của dữ liệu mới giải phóng byte).
+                    let b = b.min(f.bytes);
                     rep.bytes_freed += b;
                     rep.files_deleted += 1;
                     progress.item(ItemAction::WouldDelete, &f.path, b, None);
@@ -488,10 +548,9 @@ mod tests {
     // đáng tin cậy và không cần đổi ACL để tạo lỗi khác NotFound (đổi ACL có rủi ro để lại thư
     // mục bị khóa nếu assert thất bại giữa chừng); đã xác nhận kind() != NotFound trước khi quét.
     //
-    // Từ khi scan_targets dựng Guard cho các gốc (mục "gốc bị loại"), Guard mở gốc này cũng lỗi
-    // (không phải "vanished") nên bị xếp vào rejected_roots TRƯỚC KHI walk() chạy tới nhánh lỗi
-    // của riêng nó ⇒ notice bây giờ là "root_rejected" thay vì "root_unreadable". Bất biến cần
-    // giữ (gốc lỗi không làm hỏng cả nhóm quét, gốc khác vẫn quét bình thường) không đổi.
+    // Guard mở gốc này lỗi (không phải "vanished", cũng không phải liên kết) ⇒ xếp vào
+    // unreadable_roots ⇒ notice "root_unreadable" (trước đây bị gộp nhầm vào "root_rejected",
+    // khiến giao diện báo "nằm dưới junction/ổ ánh xạ" sai nghĩa).
     #[test]
     fn root_with_unreadable_metadata_is_skipped_with_a_notice_other_targets_still_scan() {
         let t = tmp();
@@ -501,10 +560,54 @@ mod tests {
         write_file(&ok_root.join("keep.tmp"), 5);
         let r = scan_targets(&[Target::all(bad_root.clone()), Target::all(ok_root)], SystemTime::now(), &CancelToken::new()).unwrap();
         assert_eq!((r.total_bytes, r.file_count), (5, 1));
-        assert!(
-            r.notices.iter().any(|n| *n == format!("root_rejected:{}", bad_root.display())),
-            "notices: {:?}",
-            r.notices
-        );
+        assert_eq!(r.notices, vec![format!("root_unreadable:{}", bad_root.display())]);
+        let rep = clean_targets(&[Target::all(bad_root.clone())], SystemTime::now(), &CleanOptions::default(), &NoProgress);
+        assert_eq!(rep.errors, vec![format!("root_unreadable:{}", bad_root.display())]);
+    }
+
+    // Thư mục con bị xóa sau khi đã vào stack (mô phỏng: đưa thẳng đường dẫn không tồn tại vào
+    // stack) ⇒ bỏ qua lặng lẽ, không sinh băng cảnh báo "unreadable_entries".
+    #[test]
+    fn directory_vanished_after_being_queued_is_not_unreadable() {
+        let t = tmp();
+        let mut w = Walk { files: vec![], dirs: vec![], unreadable: 0 };
+        let gone = vec![t.path().join("da-xoa"), t.path().join("khong-co").join("con")];
+        walk_dirs(&mut w, gone, true, None, &mut HashSet::new()).unwrap();
+        assert_eq!(w.unreadable, 0);
+        // Đối chứng: lỗi thật (tên không hợp lệ) vẫn được đếm.
+        let mut w = Walk { files: vec![], dirs: vec![], unreadable: 0 };
+        walk_dirs(&mut w, vec![t.path().join("sai-?-*")], true, None, &mut HashSet::new()).unwrap();
+        assert_eq!(w.unreadable, 1);
+    }
+
+    #[test]
+    fn hard_links_are_counted_once_by_scan_dry_run_and_clean() {
+        let t = tmp();
+        let root = t.path().join("Windows.old");
+        let a = write_file(&root.join("a").join("kernel32.dll"), 1000);
+        fs::create_dir_all(root.join("b")).unwrap();
+        fs::hard_link(&a, root.join("b").join("kernel32.dll")).unwrap();
+        fs::hard_link(&a, root.join("kernel32.dll")).unwrap();
+        write_file(&root.join("rieng.bin"), 7);
+        let targets = [Target::all(root.clone())];
+        let scan = scan_targets(&targets, SystemTime::now(), &CancelToken::new()).unwrap();
+        assert_eq!((scan.total_bytes, scan.file_count), (1007, 4));
+        let dry = clean_targets(&targets, SystemTime::now(), &CleanOptions { dry_run: true }, &NoProgress);
+        assert_eq!(dry.bytes_freed, 1007);
+        assert!(a.exists());
+        let rep = clean_targets(&targets, SystemTime::now(), &CleanOptions::default(), &NoProgress);
+        assert_eq!((rep.bytes_freed, rep.files_deleted), (1007, 4));
+        assert!(rep.errors.is_empty(), "{:?}", rep.errors);
+    }
+
+    #[test]
+    fn hard_links_under_two_roots_of_one_scan_are_counted_once() {
+        let t = tmp();
+        let a = write_file(&t.path().join("r1").join("x"), 1000);
+        fs::create_dir_all(t.path().join("r2")).unwrap();
+        fs::hard_link(&a, t.path().join("r2").join("x")).unwrap();
+        let targets = [Target::all(t.path().join("r1")), Target::all(t.path().join("r2"))];
+        let scan = scan_targets(&targets, SystemTime::now(), &CancelToken::new()).unwrap();
+        assert_eq!(scan.total_bytes, 1000);
     }
 }
