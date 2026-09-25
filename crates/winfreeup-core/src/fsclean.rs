@@ -156,7 +156,14 @@ pub fn roots_of(targets: &[Target]) -> Vec<PathBuf> {
 
 pub fn scan_targets(targets: &[Target], now: SystemTime, cancel: &CancelToken) -> Result<ScanResult> {
     let mut r = ScanResult::default();
+    // Guard chỉ sống trong lời gọi này (không lưu lại): xét gốc nào là reparse point hoặc có
+    // tổ tiên là junction/ổ ánh xạ, để bỏ qua trước khi quét thay vì đếm nhầm byte dưới đó.
+    let guard = Guard::new(&roots_of(targets));
     for t in targets {
+        if guard.rejected_roots().iter().any(|p| p == &t.root) {
+            r.notices.push(format!("root_rejected:{}", t.root.display()));
+            continue;
+        }
         let w = match walk(&t.root, t.recursive, Some(cancel)) {
             Ok(w) => w,
             // Hủy quét là tín hiệu toàn cục ⇒ dừng ngay, không chỉ bỏ qua gốc này.
@@ -175,9 +182,15 @@ pub fn scan_targets(targets: &[Target], now: SystemTime, cancel: &CancelToken) -
 }
 
 pub fn clean_targets(targets: &[Target], now: SystemTime, opts: &CleanOptions, progress: &dyn Progress) -> CleanReport {
+    // Guard chỉ sống trong lời gọi này (không lưu vào struct dài hạn): gốc bị loại thì bỏ qua cả
+    // target, ghi một dòng lỗi duy nhất thay vì mỗi file dưới nó một lỗi OutsideRoots.
     let guard = Guard::new(&roots_of(targets));
     let mut rep = CleanReport { dry_run: opts.dry_run, ..Default::default() };
     for t in targets {
+        if guard.rejected_roots().iter().any(|p| p == &t.root) {
+            rep.errors.push(format!("root_rejected:{}", t.root.display()));
+            continue;
+        }
         let mut w = match walk(&t.root, t.recursive, None) {
             Ok(w) => w,
             Err(e) => {
@@ -374,6 +387,34 @@ mod tests {
         assert!(fs::symlink_metadata(root.join("link")).is_err());
     }
 
+    // Gốc bản thân là junction (vd AppData chuyển ổ bằng junction): Guard::new loại nó ngay khi
+    // dựng, nên scan_targets phải bỏ qua trước khi quét (không đếm byte dưới đích junction) và
+    // phát đúng 1 notice để giao diện dịch cho người dùng.
+    #[test]
+    fn root_that_is_a_junction_is_skipped_by_scan_with_a_notice() {
+        let t = tmp();
+        let outside = t.path().join("that-that");
+        write_file(&outside.join("secret.txt"), 999);
+        let fake_root = t.path().join("Temp");
+        junction::create(&outside, &fake_root).unwrap();
+        let r = scan_targets(&[Target::all(fake_root.clone())], SystemTime::now(), &CancelToken::new()).unwrap();
+        assert_eq!((r.total_bytes, r.file_count), (0, 0));
+        assert_eq!(r.notices, vec![format!("root_rejected:{}", fake_root.display())]);
+    }
+
+    #[test]
+    fn root_that_is_a_junction_is_skipped_by_clean_with_one_error_line_and_deletes_nothing() {
+        let t = tmp();
+        let outside = t.path().join("that-that");
+        let secret = write_file(&outside.join("secret.txt"), 999);
+        let fake_root = t.path().join("Temp");
+        junction::create(&outside, &fake_root).unwrap();
+        let rep = clean_targets(&[Target::all(fake_root.clone())], SystemTime::now(), &CleanOptions::default(), &NoProgress);
+        assert_eq!(rep.errors, vec![format!("root_rejected:{}", fake_root.display())]);
+        assert_eq!((rep.bytes_freed, rep.files_deleted), (0, 0));
+        assert!(secret.exists());
+    }
+
     #[test]
     fn locked_file_is_counted_and_the_rest_still_cleaned() {
         let t = tmp();
@@ -441,6 +482,11 @@ mod tests {
     // ghi lỗi rồi đi tiếp. Mô phỏng bằng tên đường dẫn không hợp lệ (ký tự `?*|`) vì đó là cách
     // đáng tin cậy và không cần đổi ACL để tạo lỗi khác NotFound (đổi ACL có rủi ro để lại thư
     // mục bị khóa nếu assert thất bại giữa chừng); đã xác nhận kind() != NotFound trước khi quét.
+    //
+    // Từ khi scan_targets dựng Guard cho các gốc (mục "gốc bị loại"), Guard mở gốc này cũng lỗi
+    // (không phải "vanished") nên bị xếp vào rejected_roots TRƯỚC KHI walk() chạy tới nhánh lỗi
+    // của riêng nó ⇒ notice bây giờ là "root_rejected" thay vì "root_unreadable". Bất biến cần
+    // giữ (gốc lỗi không làm hỏng cả nhóm quét, gốc khác vẫn quét bình thường) không đổi.
     #[test]
     fn root_with_unreadable_metadata_is_skipped_with_a_notice_other_targets_still_scan() {
         let t = tmp();
@@ -451,7 +497,7 @@ mod tests {
         let r = scan_targets(&[Target::all(bad_root.clone()), Target::all(ok_root)], SystemTime::now(), &CancelToken::new()).unwrap();
         assert_eq!((r.total_bytes, r.file_count), (5, 1));
         assert!(
-            r.notices.iter().any(|n| *n == format!("root_unreadable:{}", bad_root.display())),
+            r.notices.iter().any(|n| *n == format!("root_rejected:{}", bad_root.display())),
             "notices: {:?}",
             r.notices
         );

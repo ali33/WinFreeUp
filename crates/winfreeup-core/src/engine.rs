@@ -199,7 +199,10 @@ mod tests {
     use super::*;
     use crate::testutil::{fake_env, FakeCleaner, FakeSys};
     use crate::types::RiskLevel::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::Duration;
 
     fn env_with(sys: FakeSys) -> (tempfile::TempDir, Arc<FakeSys>, Env) {
         let t = tempfile::tempdir().unwrap();
@@ -310,6 +313,74 @@ mod tests {
         assert!(log.contains("[a] DELETED 10 a"));
         assert!(log.contains("GROUP b ERROR"));
         assert!(log.contains("END"));
+    }
+
+    /// Đếm số lời gọi `clean` đang chạy đồng thời (dựng cục bộ trong module test này, không
+    /// dùng chung `FakeCleaner`): `enter` tăng rồi ghi lại đỉnh cao nhất từng thấy, `exit` giảm.
+    #[derive(Default)]
+    struct ConcurrencyProbe {
+        current: AtomicUsize,
+        max_seen: AtomicUsize,
+    }
+
+    impl ConcurrencyProbe {
+        fn enter(&self) {
+            let now = self.current.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_seen.fetch_max(now, Ordering::SeqCst);
+        }
+        fn exit(&self) {
+            self.current.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Cleaner giả có `clean` cố tình chậm (ngủ 20ms): nếu `run_clean` từng dọn song song
+    /// (như `scan_all` dùng `thread::scope`), phép ngủ này đủ để hai lời gọi chồng lên nhau và
+    /// `ConcurrencyProbe` bắt được đỉnh > 1.
+    struct SlowCleaner {
+        id: &'static str,
+        probe: Arc<ConcurrencyProbe>,
+    }
+
+    impl Cleaner for SlowCleaner {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+        fn risk(&self) -> RiskLevel {
+            Safe
+        }
+        fn default_selected(&self) -> bool {
+            true
+        }
+        fn allowed_roots(&self, _env: &Env) -> Vec<std::path::PathBuf> {
+            vec![]
+        }
+        fn scan(&self, _env: &Env, _cancel: &CancelToken) -> Result<ScanResult> {
+            Ok(ScanResult::default())
+        }
+        fn clean(&self, _env: &Env, _scan: &ScanResult, _opts: &CleanOptions, _progress: &dyn Progress) -> Result<CleanReport> {
+            self.probe.enter();
+            thread::sleep(Duration::from_millis(20));
+            self.probe.exit();
+            Ok(CleanReport::default())
+        }
+    }
+
+    // Không đổi mã engine: `run_clean` đã là một vòng `for` tuần tự (không `thread::scope` như
+    // `scan_all`). Test này chỉ chứng minh điều đó bằng bằng chứng thời gian thực, để một lần
+    // sửa sau này lỡ đổi sang chạy song song sẽ bị bắt ngay.
+    #[test]
+    fn run_clean_runs_groups_sequentially_never_two_clean_calls_overlap() {
+        let (t, _s, env) = env_with(FakeSys::default());
+        let probe = Arc::new(ConcurrencyProbe::default());
+        let cs: Vec<Box<dyn Cleaner>> = vec![
+            Box::new(SlowCleaner { id: "a", probe: probe.clone() }),
+            Box::new(SlowCleaner { id: "b", probe: probe.clone() }),
+            Box::new(SlowCleaner { id: "c", probe: probe.clone() }),
+        ];
+        let dir = t.path().join("logs");
+        let s = run_clean(&cs, &env, &ids(&["a", "b", "c"]), &HashMap::new(), &CleanOptions::default(), &dir, &|_| {}).unwrap();
+        assert_eq!(s.groups.len(), 3);
+        assert_eq!(probe.max_seen.load(Ordering::SeqCst), 1, "clean phải chạy tuần tự, không đồng thời");
     }
 
     #[test]
