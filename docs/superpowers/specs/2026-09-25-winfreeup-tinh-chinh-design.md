@@ -87,7 +87,9 @@ Luôn **tính từ máy thật**, không từ ký ức của app:
 
 ### 3.3 Hoàn tác
 
-- Trước khi chạy một thao tác, chụp giá trị cũ vào `%LOCALAPPDATA%\WinFreeUp\tweaks-undo.json`
+- Trước khi chạy một thao tác, chụp giá trị cũ vào `%ProgramData%\WinFreeUp\<SID>\tweaks-undo.json`
+  (thư mục DACL chỉ SYSTEM + Administrators; sửa 2026-09-25, trước là `%LOCALAPPDATA%` — lý do ở spec
+  v0.1 mục 2.4; file hoặc thư mục là reparse point ⇒ từ chối đọc/ghi)
   (theo `tweak_id` + chỉ số thao tác). **Chỉ ghi lần đầu** — áp dụng lại không đè ảnh chụp gốc.
 - Hoàn tác thành công ⇒ xóa ảnh chụp của mục đó.
 - Không có ảnh chụp ⇒ dùng `default` trong danh mục.
@@ -181,7 +183,9 @@ Chỉ app **đang có trên máy** mới hiện trong danh sách.
                                         [Hoàn tác đã chọn]  [Áp dụng 9 thay đổi]
 ```
 
-- Mở tab ⇒ đọc trạng thái mọi mục (vòng quay; liệt kê app 1–3 giây).
+- Mở tab ⇒ đọc trạng thái mọi mục (vòng quay; liệt kê app 1–3 giây). Mặc định tích sẵn **chỉ các mục
+  quyền riêng tư** của mức Cơ bản; **không mục gỡ app nào được tích sẵn** (người dùng có thể đang dùng
+  Spotify, game… — gỡ là mất đăng nhập, dữ liệu). Quyết định 2026-09-25.
 - Bấm mức sẵn ⇒ tích mọi mục có `level` ≤ mức đó, bỏ tích phần còn lại; mục không hỗ trợ/bị quản lý
   không bao giờ được tích.
 - Nút **Áp dụng** đếm số thay đổi thật (bỏ qua mục đã ở trạng thái đích).
