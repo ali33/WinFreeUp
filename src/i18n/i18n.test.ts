@@ -54,4 +54,13 @@ describe('catalog', () => {
     expect(unreadable).toContain(path);
     expect(unreadable).not.toContain('root_unreadable:');
   });
+
+  it('dịch mã thông báo số mục không đọc được và id chưa quét, không lộ mã thô', () => {
+    const entries = noticeText('unreadable_entries:3');
+    expect(entries).toContain('3');
+    expect(entries).not.toContain('unreadable_entries:');
+    const notScanned = noticeText('not_scanned');
+    expect(notScanned).not.toBe('not_scanned');
+    expect(notScanned.length).toBeGreaterThan(0);
+  });
 });

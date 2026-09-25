@@ -190,7 +190,7 @@ async function runClean(d: Deps): Promise<void> {
     d.store.dispatch({ type: 'CLEAN_DONE', summary });
     for (const g of summary.groups) {
       if (g.error) {
-        d.notify('warning', t('notice.groupFailed', { name: groupName(g.id), message: g.error }));
+        d.notify('warning', t('notice.groupFailed', { name: groupName(g.id), message: noticeText(g.error) }));
       } else if (g.report && g.report.errors.length > 0) {
         d.notify('warning', t('notice.groupErrors', { name: groupName(g.id), count: g.report.errors.length, first: noticeText(g.report.errors[0]) }));
       }

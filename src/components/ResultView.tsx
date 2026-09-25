@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Body1, Button, Caption1 } from '@fluentui/react-components';
-import { groupName } from '../catalog';
+import { groupName, noticeText } from '../catalog';
 import { formatBytes } from '../format';
 import { t } from '../i18n';
 import type { State } from '../state/machine';
@@ -39,7 +39,7 @@ export function ResultView({ state, onOpenLog, onHome }: { state: State; onOpenL
               <span className="wfu-group-title">{groupName(g.id)}</span>
               {g.report && g.report.skipped_locked > 0 && <span className="wfu-muted">{t('result.skipped', { count: g.report.skipped_locked })}</span>}
               {g.report && g.report.errors.length > 0 && <span className="wfu-muted">{t('result.groupItemErrors', { count: g.report.errors.length })}</span>}
-              {g.error && <span className="wfu-muted">{t('result.groupError', { message: g.error })}</span>}
+              {g.error && <span className="wfu-muted">{t('result.groupError', { message: noticeText(g.error) })}</span>}
             </div>
             <span className="wfu-group-size">
               {g.report ? t('result.groupOk', { size: formatBytes(g.report.bytes_freed), files: g.report.files_deleted }) : '—'}

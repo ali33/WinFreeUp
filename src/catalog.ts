@@ -36,6 +36,10 @@ export function noticeText(code: string): string {
     return t('notice.rootRejected', { path: code.slice('root_rejected:'.length) });
   } else if (code.startsWith('root_unreadable:')) {
     return t('notice.rootUnreadable', { path: code.slice('root_unreadable:'.length) });
+  } else if (code.startsWith('unreadable_entries:')) {
+    return t('notice.unreadableEntries', { count: code.slice('unreadable_entries:'.length) });
+  } else if (code === 'not_scanned') {
+    return t('notice.notScanned');
   }
   return code;
 }
