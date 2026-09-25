@@ -139,10 +139,17 @@ pub async fn clean(app: AppHandle, state: State<'_, Shared>, ids: Vec<String>, d
         let env = st.fresh_env();
         let scans = st.scans.lock().map(|m| m.clone()).unwrap_or_default();
         let opts = CleanOptions { dry_run: dry_run || st.dry_run_cli };
-        engine::run_clean(&st.cleaners, &env, &ids, &scans, &opts, &log_dir(&env.local_appdata), &|ev| {
+        let result = engine::run_clean(&st.cleaners, &env, &ids, &scans, &opts, &log_dir(&env.local_appdata), &|ev| {
             let _ = app.emit("clean-progress", ev);
-        })
-        .map_err(|e| e.to_string())
+        });
+        // Buộc quét lại trước lần dọn kế tiếp: id vừa dọn (kể cả dọn lỗi/not_scanned/unknown)
+        // không còn phản ánh đúng trạng thái ổ đĩa hiện tại.
+        if let Ok(mut map) = st.scans.lock() {
+            for id in &ids {
+                map.remove(id);
+            }
+        }
+        result.map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?

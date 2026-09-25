@@ -276,6 +276,20 @@ describe('dọn', () => {
     expect(call?.[1]).not.toContain('root_rejected:');
   });
 
+  it('id chưa quét (not_scanned) trong GroupClean.error hiện thành câu tiếng Việt, không lộ mã thô', async () => {
+    const s: CleanSummary = {
+      groups: [{ id: 'user_temp', report: null, error: 'not_scanned' }],
+      log_path: 'x',
+      dry_run: false,
+      log_write_failed: false,
+    };
+    const { d, notify } = setup({ clean: vi.fn(async () => s) });
+    await c.startScan(d);
+    await c.requestClean(d);
+    const call = notify.mock.calls.find((args) => args[0] === 'warning' && String(args[1]).includes('File tạm của bạn'));
+    expect(call?.[1]).not.toContain('not_scanned');
+  });
+
   it('chế độ chạy thử truyền dryRun=true', async () => {
     const { d, api } = setup({ appInfo: vi.fn(async () => ({ version: '0.1.0', dry_run: true, system_drive: 'C:\\' })) });
     await c.loadInitial(d);

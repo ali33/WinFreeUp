@@ -134,6 +134,12 @@ describe('ResultView', () => {
     expect(screen.getByText('1,5 GB')).toBeTruthy();
   });
 
+  it('nhóm not_scanned hiện câu tiếng Việt, không lộ mã thô', () => {
+    const s: CleanSummary = { groups: [{ id: 'user_temp', report: null, error: 'not_scanned' }], log_path: 'x', dry_run: false, log_write_failed: false };
+    wrap(<ResultView state={atResult(s)} onOpenLog={async () => {}} onHome={() => {}} />);
+    expect(screen.queryByText(/not_scanned/)).toBeNull();
+  });
+
   it('Xem nhật ký có vòng quay khi đang mở; Về đầu', async () => {
     let finish: () => void = () => {};
     const onOpenLog = vi.fn(() => new Promise<void>((r) => (finish = r)));

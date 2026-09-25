@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Quyền cho cửa sổ chính",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten"]
 }

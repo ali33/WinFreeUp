@@ -150,15 +150,21 @@ pub fn run_clean(
     log.line(&format!("START dry_run={} ids={}", opts.dry_run, ids.join(",")));
     let mut seen = HashSet::new();
     let mut groups = Vec::new();
-    let empty = ScanResult::default();
     for id in ids.iter().filter(|id| seen.insert(id.as_str())) {
         on_event(CleanEvent::Started { id: id.clone() });
         log.line(&format!("GROUP {id} START"));
         let g = match cleaners.iter().find(|c| c.id() == id) {
             None => GroupClean { id: id.clone(), report: None, error: Some(format!("unknown cleaner id: {id}")) },
+            // Id không có kết quả quét trong `scans` (chưa từng quét, hoặc đã bị xoá khỏi
+            // `scans` sau lần dọn trước) ⇒ KHÔNG dọn: dọn với ScanResult rỗng khiến cleaner tự
+            // liệt kê lại toàn bộ mục hiện có rồi xoá, bỏ qua danh sách người dùng đã thấy và
+            // đồng ý ở bước xem trước.
+            Some(_) if !scans.contains_key(id.as_str()) => {
+                GroupClean { id: id.clone(), report: None, error: Some("not_scanned".to_string()) }
+            }
             Some(c) => {
                 let progress = GroupProgress { log: &log, id: id.as_str(), on_event };
-                let scan = scans.get(id).unwrap_or(&empty);
+                let scan = &scans[id.as_str()];
                 match catch_unwind(AssertUnwindSafe(|| c.clean(env, scan, opts, &progress))) {
                     Ok(Ok(r)) => GroupClean { id: id.clone(), report: Some(r), error: None },
                     Ok(Err(e)) => GroupClean { id: id.clone(), report: None, error: Some(e.to_string()) },
@@ -213,6 +219,12 @@ mod tests {
 
     fn ids(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `scans` giả cho `run_clean`: mỗi id trong `v` có một `ScanResult` rỗng, để mô phỏng
+    /// "đã quét" mà không quan tâm nội dung quét (các test dưới đây chỉ cần id có mặt).
+    fn scanned(v: &[&str]) -> HashMap<String, ScanResult> {
+        v.iter().map(|s| (s.to_string(), ScanResult::default())).collect()
     }
 
     #[test]
@@ -297,7 +309,9 @@ mod tests {
         ];
         let events = Mutex::new(Vec::new());
         let dir = t.path().join("logs");
-        let s = run_clean(&cs, &env, &ids(&["a", "b", "zzz", "a"]), &HashMap::new(), &CleanOptions { dry_run: true }, &dir, &|e| {
+        // "a" và "b" phải có mặt trong `scans` (đã quét) để test này giữ nguyên ý định ban đầu
+        // (cô lập lỗi/panic khi CLEAN, không phải hành vi not_scanned — test riêng ở dưới).
+        let s = run_clean(&cs, &env, &ids(&["a", "b", "zzz", "a"]), &scanned(&["a", "b"]), &CleanOptions { dry_run: true }, &dir, &|e| {
             events.lock().unwrap().push(serde_json::to_value(&e).unwrap())
         })
         .unwrap();
@@ -378,9 +392,25 @@ mod tests {
             Box::new(SlowCleaner { id: "c", probe: probe.clone() }),
         ];
         let dir = t.path().join("logs");
-        let s = run_clean(&cs, &env, &ids(&["a", "b", "c"]), &HashMap::new(), &CleanOptions::default(), &dir, &|_| {}).unwrap();
+        let s = run_clean(&cs, &env, &ids(&["a", "b", "c"]), &scanned(&["a", "b", "c"]), &CleanOptions::default(), &dir, &|_| {}).unwrap();
         assert_eq!(s.groups.len(), 3);
         assert_eq!(probe.max_seen.load(Ordering::SeqCst), 1, "clean phải chạy tuần tự, không đồng thời");
+    }
+
+    // Mục 1 (rà Task 17 / fsclean): id không có trong `scans` (chưa quét, hoặc đã bị xoá khỏi
+    // `scans` sau một lần dọn trước — mục 2) không được dọn, dù cleaner tồn tại. `clean` không
+    // bao giờ được gọi (dùng cleaner panic-khi-clean để bắt lỗi ngay nếu bất biến này bị phá).
+    #[test]
+    fn run_clean_refuses_an_id_with_no_scan_result_and_never_calls_clean() {
+        let (t, _s, env) = env_with(FakeSys::default());
+        let cs: Vec<Box<dyn Cleaner>> = vec![Box::new(FakeCleaner { id: "a", risk: Safe, bytes: 0, fail: None, panics: true })];
+        let dir = t.path().join("logs");
+        let s = run_clean(&cs, &env, &ids(&["a"]), &HashMap::new(), &CleanOptions::default(), &dir, &|_| {}).unwrap();
+        assert_eq!(s.groups.len(), 1);
+        assert!(s.groups[0].report.is_none());
+        assert_eq!(s.groups[0].error.as_deref(), Some("not_scanned"), "clean() không được gọi khi id chưa được quét");
+        let log = std::fs::read_to_string(&s.log_path).unwrap();
+        assert!(log.contains("GROUP a ERROR not_scanned"));
     }
 
     #[test]
