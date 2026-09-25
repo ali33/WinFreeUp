@@ -10,6 +10,15 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-25-winfreeup-tinh-chinh-design.md` — kế hoạch dùng lại khung v0.1 theo `docs/superpowers/plans/2026-09-25-winfreeup-don-o-dia.md` (Task 8 `log`/`engine::RestorePointStatus`, Task 9 `Env`/`RealSystem`, Task 10 `vi.json`/`api/types.ts`, Task 12 `Busy`/`errors`, Task 12 `state/store.ts`, Task 16 `App.tsx`, Task 17 vỏ Tauri, Task 18 CI).
 
+
+> **Điều chỉnh sau khi viết (2026-09-25, người dùng quyết — ĐÈ lên mọi chỗ khác trong kế hoạch này):**
+> - Mọi dữ liệu app (nhật ký, file hoàn tác, file trạng thái) KHÔNG nằm ở `%LOCALAPPDATA%\WinFreeUp\` mà ở
+>   `%ProgramData%\WinFreeUp\<SID>\` qua `winfreeup_core::secure_data_dir()` (DACL chỉ SYSTEM + Administrators;
+>   thư mục có sẵn là reparse point hoặc ACL lỏng ⇒ từ chối). Nhật ký: `secure_data_dir()\logs\`.
+> - Tiến trình Admin không đọc biến môi trường cho đường dẫn hệ thống/hồ sơ; lấy qua API hoặc registry.
+> - Chỗ nào bên dưới còn ghi `%LOCALAPPDATA%` hay `std::env::var("LOCALAPPDATA")` là bản cũ — làm theo ghi chú này.
+> - Mở tab Tinh chỉnh chỉ tích sẵn các mục `group = privacy` của mức Cơ bản; không mục gỡ app nào được tích sẵn.
+
 ## Global Constraints
 
 Giá trị chép nguyên văn từ spec; mọi task ngầm bao gồm mục này.
