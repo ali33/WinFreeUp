@@ -194,7 +194,12 @@ pub fn clean_targets(targets: &[Target], now: SystemTime, opts: &CleanOptions, p
         let mut w = match walk(&t.root, t.recursive, None) {
             Ok(w) => w,
             Err(e) => {
-                rep.errors.push(e.to_string());
+                // Lỗi thô (vd "C:\...: Access is denied. (os error 5)") không được lộ ra giao
+                // diện (lộ đường dẫn/hệ thống, người dùng không đọc được) — mã hoá bằng tiền tố
+                // "root_unreadable:" giống scan_targets để catalog.ts::noticeText dịch được, còn
+                // thông điệp gốc vẫn vào nhật ký qua progress (ItemAction::Failed).
+                progress.item(ItemAction::Failed, &t.root, 0, Some(&e.to_string()));
+                rep.errors.push(format!("root_unreadable:{}", t.root.display()));
                 continue;
             }
         };
