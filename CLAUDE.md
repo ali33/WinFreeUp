@@ -31,7 +31,10 @@ Kế hoạch triển khai viết xong ⇒ **thi công ngay, không chờ duyệt
 5. **Gộp vào nhánh tính năng**, rồi chạy **toàn bộ** `cargo test` + Vitest trên nhánh đã gộp.
    Đỏ ⇒ sửa xong mới mở đợt kế tiếp. Gộp xong thì xoá worktree và nhánh task.
 6. **Dừng và hỏi người dùng** trước khi: push hoặc merge vào `main`, cài công cụ hệ thống
-   (Rust, Node, Tauri CLI, SDK…), hoặc gặp quyết định nghiệp vụ mà spec chưa trả lời.
+   **ngoài** danh sách dưới, hoặc gặp quyết định nghiệp vụ mà spec chưa trả lời.
+7. **Được phép cài/nâng cấp không cần hỏi** (người dùng cho phép 2026-09-25): Rust toolchain
+   (`rustup`, `cargo`), Node.js/npm, Tauri CLI, cùng gói npm và crate mà kế hoạch yêu cầu. Máy lúc đó
+   đã có Rust 1.90.0, Node 22.14.0, Tauri CLI 2.11.4, MSVC Build Tools.
 
 Vì sao: người dùng muốn tiến độ nhanh nên chạy song song; worktree riêng để các đội không ghi đè
 nhau; kiểm lại toàn bộ sau mỗi đợt vì từng task qua test riêng chưa có nghĩa là gộp lại vẫn chạy.
